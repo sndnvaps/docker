@@ -54,6 +54,9 @@ server when it starts up, and cannot be changed once it is running:
  *  `--bip=CIDR` — see
     [Customizing docker0](#docker0)
 
+ *  `--fixed-cidr` — see
+    [Customizing docker0](#docker0)
+
  *  `-H SOCKET...` or `--host=SOCKET...` —
     This might sound like it would affect container networking,
     but it actually faces in the other direction:
@@ -150,7 +153,10 @@ Four different options affect container domain name services.
     `CONTAINER_NAME`.  This lets processes inside the new container
     connect to the hostname `ALIAS` without having to know its IP.  The
     `--link=` option is discussed in more detail below, in the section
-    [Communication between containers](#between-containers).
+    [Communication between containers](#between-containers). Because
+    Docker may assign a different IP address to the linked containers
+    on restart, Docker updates the `ALIAS` entry in the `/etc/hosts` file
+    of the recipient containers.
 
  *  `--dns=IP_ADDRESS...` — sets the IP addresses added as `server`
     lines to the container's `/etc/resolv.conf` file.  Processes in the
@@ -170,12 +176,41 @@ above, will make `/etc/resolv.conf` inside of each container look like
 the `/etc/resolv.conf` of the host machine where the `docker` daemon is
 running.  The options then modify this default configuration.
 
+## Communication between containers and the wider world
+
+<a name="the-world"></a>
+
+Whether a container can talk to the world is governed by one main factor.
+
+Is the host machine willing to forward IP packets?  This is governed
+by the `ip_forward` system parameter.  Packets can only pass between
+containers if this parameter is `1`.  Usually you will simply leave
+the Docker server at its default setting `--ip-forward=true` and
+Docker will go set `ip_forward` to `1` for you when the server
+starts up.  To check the setting or turn it on manually:
+
+    # Usually not necessary: turning on forwarding,
+    # on the host where your Docker server is running
+
+    $ cat /proc/sys/net/ipv4/ip_forward
+    0
+    $ sudo echo 1 > /proc/sys/net/ipv4/ip_forward
+    $ cat /proc/sys/net/ipv4/ip_forward
+    1
+
+Many using Docker will want `ip_forward` to be on, to at
+least make communication *possible* between containers and
+the wider world.
+
+May also be needed for inter-container communication if you are
+in a multiple bridge setup.
+
 ## Communication between containers
 
 <a name="between-containers"></a>
 
 Whether two containers can communicate is governed, at the operating
-system level, by three factors.
+system level, by two factors.
 
 1.  Does the network topology even connect the containers' network
     interfaces?  By default Docker will attach all containers to a
@@ -183,32 +218,14 @@ system level, by three factors.
     between them.  See the later sections of this document for other
     possible topologies.
 
-2.  Is the host machine willing to forward IP packets?  This is governed
-    by the `ip_forward` system parameter.  Packets can only pass between
-    containers if this parameter is `1`.  Usually you will simply leave
-    the Docker server at its default setting `--ip-forward=true` and
-    Docker will go set `ip_forward` to `1` for you when the server
-    starts up.  To check the setting or turn it on manually:
-
-        # Usually not necessary: turning on forwarding,
-        # on the host where your Docker server is running
-
-        $ cat /proc/sys/net/ipv4/ip_forward
-        0
-        $ sudo echo 1 > /proc/sys/net/ipv4/ip_forward
-        $ cat /proc/sys/net/ipv4/ip_forward
-        1
-
-3.  Do your `iptables` allow this particular connection to be made?
+2.  Do your `iptables` allow this particular connection to be made?
     Docker will never make changes to your system `iptables` rules if
     you set `--iptables=false` when the daemon starts.  Otherwise the
     Docker server will add a default rule to the `FORWARD` chain with a
     blanket `ACCEPT` policy if you retain the default `--icc=true`, or
     else will set the policy to `DROP` if `--icc=false`.
 
-Nearly everyone using Docker will want `ip_forward` to be on, to at
-least make communication *possible* between containers.  But it is a
-strategic question whether to leave `--icc=true` or change it to
+It is a strategic question whether to leave `--icc=true` or change it to
 `--icc=false` (on Ubuntu, by editing the `DOCKER_OPTS` variable in
 `/etc/default/docker` and restarting the Docker server) so that
 `iptables` will protect other containers — and the main host — from
@@ -296,13 +313,13 @@ page.  There are two approaches.
 First, you can supply `-P` or `--publish-all=true|false` to `docker run`
 which is a blanket operation that identifies every port with an `EXPOSE`
 line in the image's `Dockerfile` and maps it to a host port somewhere in
-the range 49000–49900.  This tends to be a bit inconvenient, since you
+the range 49153–65535.  This tends to be a bit inconvenient, since you
 then have to run other `docker` sub-commands to learn which external
 port a given service was mapped to.
 
 More convenient is the `-p SPEC` or `--publish=SPEC` option which lets
 you be explicit about exactly which external port on the Docker server —
-which can be any port at all, not just those in the 49000–49900 block —
+which can be any port at all, not just those in the 49153-65535 block —
 you want mapped to which port in the container.
 
 Either way, you should be able to peek at what Docker has accomplished
@@ -351,16 +368,24 @@ By default, the Docker server creates and configures the host system's
 can pass packets back and forth between other physical or virtual
 network interfaces so that they behave as a single Ethernet network.
 
-Docker configures `docker0` with an IP address and netmask so the host
-machine can both receive and send packets to containers connected to the
-bridge, and gives it an MTU — the *maximum transmission unit* or largest
-packet length that the interface will allow — of either 1,500 bytes or
-else a more specific value copied from the Docker host's interface that
-supports its default route.  Both are configurable at server startup:
+Docker configures `docker0` with an IP address, netmask and IP
+allocation range. The host machine can both receive and send packets to
+containers connected to the bridge, and gives it an MTU — the *maximum
+transmission unit* or largest packet length that the interface will
+allow — of either 1,500 bytes or else a more specific value copied from
+the Docker host's interface that supports its default route.  These
+options are configurable at server startup:
 
  *  `--bip=CIDR` — supply a specific IP address and netmask for the
     `docker0` bridge, using standard CIDR notation like
     `192.168.1.5/24`.
+
+ *  `--fixed-cidr=CIDR` — restrict the IP range from the `docker0` subnet,
+    using the standard CIDR notation like `172.167.1.0/28`. This range must
+    be and IPv4 range for fixed IPs (ex: 10.20.0.0/16) and must be a subset
+    of the bridge IP range (`docker0` or set using `--bridge`). For example
+    with `--fixed-cidr=192.168.1.0/25`, IPs for your containers will be chosen
+    from the first half of `192.168.1.0/24` subnet.
 
  *  `--mtu=BYTES` — override the maximum packet length on `docker0`.
 
@@ -424,7 +449,7 @@ If you want to take Docker out of the business of creating its own
 Ethernet bridge entirely, you can set up your own bridge before starting
 Docker and use `-b BRIDGE` or `--bridge=BRIDGE` to tell Docker to use
 your bridge instead.  If you already have Docker up and running with its
-old `bridge0` still configured, you will probably want to begin by
+old `docker0` still configured, you will probably want to begin by
 stopping the service and removing the interface:
 
     # Stopping Docker and removing docker0
@@ -539,7 +564,7 @@ values.
     It also allows the container to access local network services
     like D-bus.  This can lead to processes in the container being
     able to do unexpected things like
-    [restart your computer](https://github.com/dotcloud/docker/issues/6401).
+    [restart your computer](https://github.com/docker/docker/issues/6401).
     You should use this option with caution.
 
  *  `--net=container:NAME_or_ID` — Tells Docker to put this container's
@@ -720,3 +745,14 @@ usual containers.  But unless you have very specific networking needs
 that drive you to such a solution, it is probably far preferable to use
 `--icc=false` to lock down inter-container communication, as we explored
 earlier.
+
+## Editing networking config files
+
+Starting with Docker v.1.2.0, you can now edit `/etc/hosts`, `/etc/hostname`
+and `/etc/resolve.conf` in a running container. This is useful if you need
+to install bind or other services that might override one of those files.
+
+Note, however, that changes to these files will not be saved by
+`docker commit`, nor will they be saved during `docker run`.
+That means they won't be saved in the image, nor will they persist when a
+container is restarted; they will only "stick" in a running container.

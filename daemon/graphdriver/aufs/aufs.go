@@ -30,11 +30,12 @@ import (
 	"sync"
 	"syscall"
 
+	log "github.com/Sirupsen/logrus"
+	"github.com/docker/docker/daemon/graphdriver"
+	"github.com/docker/docker/pkg/archive"
+	mountpk "github.com/docker/docker/pkg/mount"
+	"github.com/docker/docker/utils"
 	"github.com/docker/libcontainer/label"
-	"github.com/dotcloud/docker/archive"
-	"github.com/dotcloud/docker/daemon/graphdriver"
-	mountpk "github.com/dotcloud/docker/pkg/mount"
-	"github.com/dotcloud/docker/utils"
 )
 
 var (
@@ -97,7 +98,7 @@ func Init(root string, options []string) (graphdriver.Driver, error) {
 		return nil, err
 	}
 
-	if err := graphdriver.MakePrivate(root); err != nil {
+	if err := mountpk.MakePrivate(root); err != nil {
 		return nil, err
 	}
 
@@ -209,7 +210,7 @@ func (a *Driver) Remove(id string) error {
 	defer a.Unlock()
 
 	if a.active[id] != 0 {
-		utils.Errorf("Warning: removing active id %s\n", id)
+		log.Errorf("Warning: removing active id %s", id)
 	}
 
 	// Make sure the dir is umounted first
@@ -293,23 +294,44 @@ func (a *Driver) Put(id string) {
 	}
 }
 
-// Returns an archive of the contents for the id
-func (a *Driver) Diff(id string) (archive.Archive, error) {
+// Diff produces an archive of the changes between the specified
+// layer and its parent layer which may be "".
+func (a *Driver) Diff(id, parent string) (archive.Archive, error) {
+	// AUFS doesn't need the parent layer to produce a diff.
 	return archive.TarWithOptions(path.Join(a.rootPath(), "diff", id), &archive.TarOptions{
 		Compression: archive.Uncompressed,
 	})
 }
 
-func (a *Driver) ApplyDiff(id string, diff archive.ArchiveReader) error {
+func (a *Driver) applyDiff(id string, diff archive.ArchiveReader) error {
 	return archive.Untar(diff, path.Join(a.rootPath(), "diff", id), nil)
 }
 
-// Returns the size of the contents for the id
-func (a *Driver) DiffSize(id string) (int64, error) {
+// DiffSize calculates the changes between the specified id
+// and its parent and returns the size in bytes of the changes
+// relative to its base filesystem directory.
+func (a *Driver) DiffSize(id, parent string) (bytes int64, err error) {
+	// AUFS doesn't need the parent layer to calculate the diff size.
 	return utils.TreeSize(path.Join(a.rootPath(), "diff", id))
 }
 
-func (a *Driver) Changes(id string) ([]archive.Change, error) {
+// ApplyDiff extracts the changeset from the given diff into the
+// layer with the specified id and parent, returning the size of the
+// new layer in bytes.
+func (a *Driver) ApplyDiff(id, parent string, diff archive.ArchiveReader) (bytes int64, err error) {
+	// AUFS doesn't need the parent id to apply the diff.
+	if err = a.applyDiff(id, diff); err != nil {
+		return
+	}
+
+	return a.DiffSize(id, parent)
+}
+
+// Changes produces a list of changes between the specified layer
+// and its parent layer. If parent is "", then all changes will be ADD changes.
+func (a *Driver) Changes(id, parent string) ([]archive.Change, error) {
+	// AUFS doesn't have snapshots, so we need to get changes from all parent
+	// layers.
 	layers, err := a.getParentLayerPaths(id)
 	if err != nil {
 		return nil, err
@@ -321,9 +343,6 @@ func (a *Driver) getParentLayerPaths(id string) ([]string, error) {
 	parentIds, err := getParentIds(a.rootPath(), id)
 	if err != nil {
 		return nil, err
-	}
-	if len(parentIds) == 0 {
-		return nil, fmt.Errorf("Dir %s does not have any parent layers", id)
 	}
 	layers := make([]string, len(parentIds))
 
@@ -378,7 +397,7 @@ func (a *Driver) Cleanup() error {
 
 	for _, id := range ids {
 		if err := a.unmount(id); err != nil {
-			utils.Errorf("Unmounting %s: %s", utils.TruncateID(id), err)
+			log.Errorf("Unmounting %s: %s", utils.TruncateID(id), err)
 		}
 	}
 

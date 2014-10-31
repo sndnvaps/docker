@@ -45,22 +45,29 @@ clone git github.com/gorilla/context 14f550f51a
 
 clone git github.com/gorilla/mux 136d54f81f
 
-clone git github.com/syndtr/gocapability 3c85049eae
-
 clone git github.com/tchap/go-patricia v1.0.1
 
 clone hg code.google.com/p/go.net 84a4013f96e0
 
 clone hg code.google.com/p/gosqlite 74691fb6f837
 
+clone git github.com/docker/libtrust d273ef2565ca
+
+clone git github.com/Sirupsen/logrus v0.5.1
+
 # get Go tip's archive/tar, for xattr support and improved performance
 # TODO after Go 1.4 drops, bump our minimum supported version and drop this vendored dep
-clone hg code.google.com/p/go 17404efd6b02
-mv src/code.google.com/p/go/src/pkg/archive/tar tmp-tar
-rm -rf src/code.google.com/p/go
-mkdir -p src/code.google.com/p/go/src/pkg/archive
-mv tmp-tar src/code.google.com/p/go/src/pkg/archive/tar
+if [ "$1" = '--go' ]; then
+	# Go takes forever and a half to clone, so we only redownload it when explicitly requested via the "--go" flag to this script.
+	clone hg code.google.com/p/go 1b17b3426e3c
+	mv src/code.google.com/p/go/src/pkg/archive/tar tmp-tar
+	rm -rf src/code.google.com/p/go
+	mkdir -p src/code.google.com/p/go/src/pkg/archive
+	mv tmp-tar src/code.google.com/p/go/src/pkg/archive/tar
+fi
 
-clone git github.com/godbus/dbus v1
-clone git github.com/coreos/go-systemd v2
-clone git github.com/docker/libcontainer 53cfe0a1eba9145bf5329abbb52b0072ccab8a00
+clone git github.com/docker/libcontainer f60d7b9195f8dc0b5d343abbc3293da7c17bb11c
+# see src/github.com/docker/libcontainer/update-vendor.sh which is the "source of truth" for libcontainer deps (just like this file)
+rm -rf src/github.com/docker/libcontainer/vendor
+eval "$(grep '^clone ' src/github.com/docker/libcontainer/update-vendor.sh | grep -v 'github.com/codegangsta/cli')"
+# we exclude "github.com/codegangsta/cli" here because it's only needed for "nsinit", which Docker doesn't include

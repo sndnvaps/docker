@@ -7,10 +7,14 @@ docker-run - Run a command in a new container
 # SYNOPSIS
 **docker run**
 [**-a**|**--attach**[=*[]*]]
+[**--add-host**[=*[]*]]
 [**-c**|**--cpu-shares**[=*0*]]
+[**--cap-add**[=*[]*]]
+[**--cap-drop**[=*[]*]]
 [**--cidfile**[=*CIDFILE*]]
 [**--cpuset**[=*CPUSET*]]
 [**-d**|**--detach**[=*false*]]
+[**--device**[=*[]*]]
 [**--dns-search**[=*[]*]]
 [**--dns**[=*[]*]]
 [**-e**|**--env**[=*[]*]]
@@ -19,6 +23,7 @@ docker-run - Run a command in a new container
 [**--expose**[=*[]*]]
 [**-h**|**--hostname**[=*HOSTNAME*]]
 [**-i**|**--interactive**[=*false*]]
+[**--security-opt**[=*[]*]]
 [**--link**[=*[]*]]
 [**--lxc-conf**[=*[]*]]
 [**-m**|**--memory**[=*MEMORY*]]
@@ -27,6 +32,7 @@ docker-run - Run a command in a new container
 [**-P**|**--publish-all**[=*false*]]
 [**-p**|**--publish**[=*[]*]]
 [**--privileged**[=*false*]]
+[**--restart**[=*POLICY*]]
 [**--rm**[=*false*]]
 [**--sig-proxy**[=*true*]]
 [**-t**|**--tty**[=*false*]]
@@ -60,6 +66,10 @@ error. It can even pretend to be a TTY (this is what most commandline
 executables expect) and pass along signals. The **-a** option can be set for
 each of stdin, stdout, and stderr.
 
+**--add-host**=*hostname*:*ip*
+   Add a line to /etc/hosts. The format is hostname:ip.  The **--add-host**
+option can be set multiple times.
+
 **-c**, **--cpu-shares**=0
    CPU shares in relative weight. You can increase the priority of a container
 with the -c option. By default, all containers run at the same priority and get
@@ -67,13 +77,19 @@ the same proportion of CPU cycles, but you can tell the kernel to give more
 shares of CPU time to one or more containers when you start them via **docker
 run**.
 
-**--cidfile**=*file*
-   Write the container ID to the file specified.
+**--cap-add**=[]
+   Add Linux capabilities
+
+**--cap-drop**=[]
+   Drop Linux capabilities
+
+**--cidfile**=""
+   Write the container ID to the file
 
 **--cpuset**=""
    CPUs in which to allow execution (0-3, 0,1)
 
-**-d**, **-detach**=*true*|*false*
+**-d**, **--detach**=*true*|*false*
    Detached mode. This runs the container in the background. It outputs the new
 container's ID and any error messages. At any time you can run **docker ps** in
 the other shell to view a list of the running containers. You can reattach to a
@@ -83,17 +99,19 @@ the detached mode, then you cannot use the **-rm** option.
    When attached in the tty mode, you can detach from a running container without
 stopping the process by pressing the keys CTRL-P CTRL-Q.
 
+**--device**=[]
+   Add a host device to the container (e.g. --device=/dev/sdc:/dev/xvdc:rwm)
+
 **--dns-search**=[]
-   Set custom dns search domains
+   Set custom DNS search domains
 
 **--dns**=*IP-address*
    Set custom DNS servers. This option can be used to override the DNS
 configuration passed to the container. Typically this is necessary when the
 host DNS configuration is invalid for the container (e.g., 127.0.0.1). When this
-is the case the **-dns** flags is necessary for every run.
+is the case the **--dns** flags is necessary for every run.
 
-
-**-e**, **-env**=*environment*
+**-e**, **--env**=*environment*
    Set environment variables. This option allows you to specify arbitrary
 environment variables that are available for the process that will be launched
 inside of the container.
@@ -110,8 +128,9 @@ pass in more options via the COMMAND. But, sometimes an operator may want to run
 something else inside the container, so you can override the default ENTRYPOINT
 at runtime by using a **--entrypoint** and a string to specify the new
 ENTRYPOINT.
+
 **--env-file**=[]
-   Read in a line delimited file of ENV variables
+   Read in a line delimited file of environment variables
 
 **--expose**=*port*
    Expose a port from the container without publishing it to your host. A
@@ -120,11 +139,18 @@ developer can expose the port using the EXPOSE parameter of the Dockerfile, 2)
 the operator can use the **--expose** option with **docker run**, or 3) the
 container can be started with the **--link**.
 
-**-h**, **-hostname**=*hostname*
+**-h**, **--hostname**=*hostname*
    Sets the container host name that is available inside the container.
 
-**-i**, **-interactive**=*true*|*false*
+**-i**, **--interactive**=*true*|*false*
    When set to true, keep stdin open even if not attached. The default is false.
+
+**--security-opt**=*secdriver*:*name*:*value*
+    "label:user:USER"   : Set the label user for the container
+    "label:role:ROLE"   : Set the label role for the container
+    "label:type:TYPE"   : Set the label type for the container
+    "label:level:LEVEL" : Set the label level for the container
+    "label:disable"     : Turn off label confinement for the container
 
 **--link**=*name*:*alias*
    Add link to another container. The format is name:alias. If the operator
@@ -136,7 +162,7 @@ which interface and port to use.
 **--lxc-conf**=[]
    (lxc exec-driver only) Add custom lxc options --lxc-conf="lxc.cgroup.cpuset.cpus = 0,1"
 
-**-m**, **-memory**=*memory-limit*
+**-m**, **--memory**=*memory-limit*
    Allows you to constrain the memory available to a container. If the host
 supports swap memory, then the -m memory setting can be larger than physical
 RAM. If a limit of 0 is specified, the container's memory is not limited. The
@@ -165,16 +191,17 @@ and foreground Docker containers.
                                'container:<name|id>': reuses another container network stack
                                'host': use the host network stack inside the container.  Note: the host mode gives the container full access to local system services such as D-bus and is therefore considered insecure.
 
-**-P**, **-publish-all**=*true*|*false*
+**-P**, **--publish-all**=*true*|*false*
    When set to true publish all exposed ports to the host interfaces. The
 default is false. If the operator uses -P (or -p) then Docker will make the
 exposed port accessible on the host and the ports will be available to any
-client that can reach the host. To find the map between the host ports and the
-exposed ports, use **docker port**.
+client that can reach the host. When using -P, Docker will bind the exposed 
+ports to a random port on the host between 49153 and 65535. To find the 
+mapping between the host ports and the exposed ports, use **docker port**.
 
-**-p**, **-publish**=[]
+**-p**, **--publish**=[]
    Publish a container's port to the host (format: ip:hostPort:containerPort |
-ip::containerPort | hostPort:containerPort) (use **docker port** to see the
+ip::containerPort | hostPort:containerPort | containerPort) (use **docker port** to see the
 actual mapping)
 
 **--privileged**=*true*|*false*
@@ -190,26 +217,21 @@ outside of a container on the host.
 
 
 **--rm**=*true*|*false*
-   If set to *true* the container is automatically removed when it exits. The
-default is *false*. This option is incompatible with **-d**.
-
+   Automatically remove the container when it exits (incompatible with -d). The default is *false*.
 
 **--sig-proxy**=*true*|*false*
-   When set to true, proxify received signals to the process (even in
-non-tty mode). SIGCHLD is not proxied. The default is *true*.
+   Proxy received signals to the process (even in non-TTY mode). SIGCHLD, SIGSTOP, and SIGKILL are not proxied. The default is *true*.
 
-
-**-t**, **-tty**=*true*|*false*
+**-t**, **--tty**=*true*|*false*
    When set to true Docker can allocate a pseudo-tty and attach to the standard
 input of any container. This can be used, for example, to run a throwaway
 interactive shell. The default is value is false.
 
+**-u**, **--user**=""
+   Username or UID
 
-**-u**, **-user**=*username*,*uid*
-   Set a username or UID for the container.
 
-
-**-v**, **-volume**=*volume*[:ro|:rw]
+**-v**, **--volume**=*volume*[:ro|:rw]
    Bind mount a volume to the container. 
 
 The **-v** option can be used one or
@@ -233,7 +255,7 @@ default, the volumes are mounted in the same mode (read write or read only) as
 the reference container.
 
 
-**-w**, **-workdir**=*directory*
+**-w**, **--workdir**=*directory*
    Working directory inside the container. The default working directory for
 running binaries within a container is the root directory (/). The developer can
 set a different default with the Dockerfile WORKDIR instruction. The operator
@@ -241,7 +263,10 @@ can override the working directory by using the **-w** option.
 
 
 **IMAGE**
-   The image name or ID.
+   The image name or ID. You can specify a version of an image you'd like to run
+   the container with by adding image:tag to the command. For example,
+   `docker run ubuntu:14.04`.
+
 
 
 **COMMAND**
@@ -319,7 +344,7 @@ to create a secure tunnel for the parent to access.
 ## Mapping Ports for External Usage
 
 The exposed port of an application can be mapped to a host port using the **-p**
-flag. For example a httpd port 80 can be mapped to the host port 8080 using the
+flag. For example, a httpd port 80 can be mapped to the host port 8080 using the
 following:
 
     # docker run -p 8080:80 -d -i -t fedora/httpd
@@ -338,7 +363,7 @@ fedora-data image:
 
 Multiple --volumes-from parameters will bring together multiple data volumes from
 multiple containers. And it's possible to mount the volumes that came from the
-DATA container in yet another container via the fedora-container1 intermidiery
+DATA container in yet another container via the fedora-container1 intermediary
 container, allowing to abstract the actual data source from users of that data:
 
     # docker run --volumes-from=fedora-container1 --name=fedora-container2 -i -t fedora bash
@@ -367,7 +392,37 @@ to the host directory:
 Now, writing to the /data1 volume in the container will be allowed and the
 changes will also be reflected on the host in /var/db.
 
+## Using alternative security labeling
+
+You can override the default labeling scheme for each container by specifying
+the `--security-opt` flag. For example, you can specify the MCS/MLS level, a
+requirement for MLS systems. Specifying the level in the following command
+allows you to share the same content between containers.
+
+    # docker run --security-opt label:level:s0:c100,c200 -i -t fedora bash
+
+An MLS example might be:
+
+    # docker run --security-opt label:level:TopSecret -i -t rhel7 bash
+
+To disable the security labeling for this container versus running with the
+`--permissive` flag, use the following command:
+
+    # docker run --security-opt label:disable -i -t fedora bash
+
+If you want a tighter security policy on the processes within a container,
+you can specify an alternate type for the container. You could run a container
+that is only allowed to listen on Apache ports by executing the following
+command:
+
+    # docker run --security-opt label:type:svirt_apache_t -i -t centos bash
+
+Note:
+
+You would have to write policy defining a `svirt_apache_t` type.
+
 # HISTORY
 April 2014, Originally compiled by William Henry (whenry at redhat dot com)
 based on docker.com source material and internal work.
 June 2014, updated by Sven Dowideit <SvenDowideit@home.org.au>
+July 2014, updated by Sven Dowideit <SvenDowideit@home.org.au>

@@ -6,8 +6,6 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -15,35 +13,22 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
-	"github.com/dotcloud/docker/dockerversion"
+	log "github.com/Sirupsen/logrus"
+	"github.com/docker/docker/dockerversion"
+	"github.com/docker/docker/pkg/fileutils"
+	"github.com/docker/docker/pkg/ioutils"
 )
 
 type KeyValuePair struct {
 	Key   string
 	Value string
-}
-
-// A common interface to access the Fatal method of
-// both testing.B and testing.T.
-type Fataler interface {
-	Fatal(args ...interface{})
-}
-
-// Go is a basic promise implementation: it wraps calls a function in a goroutine,
-// and returns a channel which will later return the function's return value.
-func Go(f func() error) chan error {
-	ch := make(chan error, 1)
-	go func() {
-		ch <- f()
-	}()
-	return ch
 }
 
 // Request a given URL and return an io.Reader
@@ -55,31 +40,6 @@ func Download(url string) (resp *http.Response, err error) {
 		return nil, fmt.Errorf("Got HTTP status code >= 400: %s", resp.Status)
 	}
 	return resp, nil
-}
-
-func logf(level string, format string, a ...interface{}) {
-	// Retrieve the stack infos
-	_, file, line, ok := runtime.Caller(2)
-	if !ok {
-		file = "<unknown>"
-		line = -1
-	} else {
-		file = file[strings.LastIndex(file, "/")+1:]
-	}
-
-	fmt.Fprintf(os.Stderr, fmt.Sprintf("[%s] %s:%d %s\n", level, file, line, format), a...)
-}
-
-// Debug function, if the debug flag is set, then display. Do nothing otherwise
-// If Docker is in damon mode, also send the debug info on the socket
-func Debugf(format string, a ...interface{}) {
-	if os.Getenv("DEBUG") != "" {
-		logf("debug", format, a...)
-	}
-}
-
-func Errorf(format string, a ...interface{}) {
-	logf("error", format, a...)
 }
 
 func Trunc(s string, maxlen int) string {
@@ -190,120 +150,9 @@ func DockerInitPath(localCopy string) string {
 	return ""
 }
 
-type NopWriter struct{}
-
-func (*NopWriter) Write(buf []byte) (int, error) {
-	return len(buf), nil
-}
-
-type nopWriteCloser struct {
-	io.Writer
-}
-
-func (w *nopWriteCloser) Close() error { return nil }
-
-func NopWriteCloser(w io.Writer) io.WriteCloser {
-	return &nopWriteCloser{w}
-}
-
-type bufReader struct {
-	sync.Mutex
-	buf    *bytes.Buffer
-	reader io.Reader
-	err    error
-	wait   sync.Cond
-}
-
-func NewBufReader(r io.Reader) *bufReader {
-	reader := &bufReader{
-		buf:    &bytes.Buffer{},
-		reader: r,
-	}
-	reader.wait.L = &reader.Mutex
-	go reader.drain()
-	return reader
-}
-
-func (r *bufReader) drain() {
-	buf := make([]byte, 1024)
-	for {
-		n, err := r.reader.Read(buf)
-		r.Lock()
-		if err != nil {
-			r.err = err
-		} else {
-			r.buf.Write(buf[0:n])
-		}
-		r.wait.Signal()
-		r.Unlock()
-		if err != nil {
-			break
-		}
-	}
-}
-
-func (r *bufReader) Read(p []byte) (n int, err error) {
-	r.Lock()
-	defer r.Unlock()
-	for {
-		n, err = r.buf.Read(p)
-		if n > 0 {
-			return n, err
-		}
-		if r.err != nil {
-			return 0, r.err
-		}
-		r.wait.Wait()
-	}
-}
-
-func (r *bufReader) Close() error {
-	closer, ok := r.reader.(io.ReadCloser)
-	if !ok {
-		return nil
-	}
-	return closer.Close()
-}
-
-type JSONLog struct {
-	Log     string    `json:"log,omitempty"`
-	Stream  string    `json:"stream,omitempty"`
-	Created time.Time `json:"time"`
-}
-
-func (jl *JSONLog) Format(format string) (string, error) {
-	if format == "" {
-		return jl.Log, nil
-	}
-	if format == "json" {
-		m, err := json.Marshal(jl)
-		return string(m), err
-	}
-	return fmt.Sprintf("[%s] %s", jl.Created.Format(format), jl.Log), nil
-}
-
-func WriteLog(src io.Reader, dst io.WriteCloser, format string) error {
-	dec := json.NewDecoder(src)
-	for {
-		l := &JSONLog{}
-
-		if err := dec.Decode(l); err == io.EOF {
-			return nil
-		} else if err != nil {
-			Errorf("Error streaming logs: %s", err)
-			return err
-		}
-		line, err := l.Format(format)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(dst, "%s", line)
-	}
-}
-
 func GetTotalUsedFds() int {
 	if fds, err := ioutil.ReadDir(fmt.Sprintf("/proc/%d/fd", os.Getpid())); err != nil {
-		Errorf("Error opening /proc/%d/fd: %s", os.Getpid(), err)
+		log.Errorf("Error opening /proc/%d/fd: %s", os.Getpid(), err)
 	} else {
 		return len(fds)
 	}
@@ -401,92 +250,6 @@ func HashData(src io.Reader) (string, error) {
 	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
 }
 
-type KernelVersionInfo struct {
-	Kernel int
-	Major  int
-	Minor  int
-	Flavor string
-}
-
-func (k *KernelVersionInfo) String() string {
-	return fmt.Sprintf("%d.%d.%d%s", k.Kernel, k.Major, k.Minor, k.Flavor)
-}
-
-// Compare two KernelVersionInfo struct.
-// Returns -1 if a < b, 0 if a == b, 1 it a > b
-func CompareKernelVersion(a, b *KernelVersionInfo) int {
-	if a.Kernel < b.Kernel {
-		return -1
-	} else if a.Kernel > b.Kernel {
-		return 1
-	}
-
-	if a.Major < b.Major {
-		return -1
-	} else if a.Major > b.Major {
-		return 1
-	}
-
-	if a.Minor < b.Minor {
-		return -1
-	} else if a.Minor > b.Minor {
-		return 1
-	}
-
-	return 0
-}
-
-func GetKernelVersion() (*KernelVersionInfo, error) {
-	var (
-		err error
-	)
-
-	uts, err := uname()
-	if err != nil {
-		return nil, err
-	}
-
-	release := make([]byte, len(uts.Release))
-
-	i := 0
-	for _, c := range uts.Release {
-		release[i] = byte(c)
-		i++
-	}
-
-	// Remove the \x00 from the release for Atoi to parse correctly
-	release = release[:bytes.IndexByte(release, 0)]
-
-	return ParseRelease(string(release))
-}
-
-func ParseRelease(release string) (*KernelVersionInfo, error) {
-	var (
-		kernel, major, minor, parsed int
-		flavor, partial              string
-	)
-
-	// Ignore error from Sscanf to allow an empty flavor.  Instead, just
-	// make sure we got all the version numbers.
-	parsed, _ = fmt.Sscanf(release, "%d.%d%s", &kernel, &major, &partial)
-	if parsed < 2 {
-		return nil, errors.New("Can't parse kernel version " + release)
-	}
-
-	// sometimes we have 3.12.25-gentoo, but sometimes we just have 3.12-1-amd64
-	parsed, _ = fmt.Sscanf(partial, ".%d%s", &minor, &flavor)
-	if parsed < 1 {
-		flavor = partial
-	}
-
-	return &KernelVersionInfo{
-		Kernel: kernel,
-		Major:  major,
-		Minor:  minor,
-		Flavor: flavor,
-	}, nil
-}
-
 // FIXME: this is deprecated by CopyWithTar in archive.go
 func CopyDirectory(source, dest string) error {
 	if output, err := exec.Command("cp", "-ra", source, dest).CombinedOutput(); err != nil {
@@ -494,10 +257,6 @@ func CopyDirectory(source, dest string) error {
 	}
 	return nil
 }
-
-type NopFlusher struct{}
-
-func (f *NopFlusher) Flush() {}
 
 type WriteFlusher struct {
 	sync.Mutex
@@ -525,7 +284,7 @@ func NewWriteFlusher(w io.Writer) *WriteFlusher {
 	if f, ok := w.(http.Flusher); ok {
 		flusher = f
 	} else {
-		flusher = &NopFlusher{}
+		flusher = &ioutils.NopFlusher{}
 	}
 	return &WriteFlusher{w: w, flusher: flusher}
 }
@@ -545,113 +304,14 @@ func IsGIT(str string) bool {
 	return strings.HasPrefix(str, "git://") || strings.HasPrefix(str, "github.com/") || strings.HasPrefix(str, "git@github.com:") || (strings.HasSuffix(str, ".git") && IsURL(str))
 }
 
-// CheckLocalDns looks into the /etc/resolv.conf,
-// it returns true if there is a local nameserver or if there is no nameserver.
-func CheckLocalDns(resolvConf []byte) bool {
-	for _, line := range GetLines(resolvConf, []byte("#")) {
-		if !bytes.Contains(line, []byte("nameserver")) {
-			continue
-		}
-		for _, ip := range [][]byte{
-			[]byte("127.0.0.1"),
-			[]byte("127.0.1.1"),
-		} {
-			if bytes.Contains(line, ip) {
-				return true
-			}
-		}
-		return false
-	}
-	return true
-}
+var (
+	localHostRx = regexp.MustCompile(`(?m)^nameserver 127[^\n]+\n*`)
+)
 
-// GetLines parses input into lines and strips away comments.
-func GetLines(input []byte, commentMarker []byte) [][]byte {
-	lines := bytes.Split(input, []byte("\n"))
-	var output [][]byte
-	for _, currentLine := range lines {
-		var commentIndex = bytes.Index(currentLine, commentMarker)
-		if commentIndex == -1 {
-			output = append(output, currentLine)
-		} else {
-			output = append(output, currentLine[:commentIndex])
-		}
-	}
-	return output
-}
-
-// FIXME: Change this not to receive default value as parameter
-func ParseHost(defaultHost string, defaultUnix, addr string) (string, error) {
-	var (
-		proto string
-		host  string
-		port  int
-	)
-	addr = strings.TrimSpace(addr)
-	switch {
-	case addr == "tcp://":
-		return "", fmt.Errorf("Invalid bind address format: %s", addr)
-	case strings.HasPrefix(addr, "unix://"):
-		proto = "unix"
-		addr = strings.TrimPrefix(addr, "unix://")
-		if addr == "" {
-			addr = defaultUnix
-		}
-	case strings.HasPrefix(addr, "tcp://"):
-		proto = "tcp"
-		addr = strings.TrimPrefix(addr, "tcp://")
-	case strings.HasPrefix(addr, "fd://"):
-		return addr, nil
-	case addr == "":
-		proto = "unix"
-		addr = defaultUnix
-	default:
-		if strings.Contains(addr, "://") {
-			return "", fmt.Errorf("Invalid bind address protocol: %s", addr)
-		}
-		proto = "tcp"
-	}
-
-	if proto != "unix" && strings.Contains(addr, ":") {
-		hostParts := strings.Split(addr, ":")
-		if len(hostParts) != 2 {
-			return "", fmt.Errorf("Invalid bind address format: %s", addr)
-		}
-		if hostParts[0] != "" {
-			host = hostParts[0]
-		} else {
-			host = defaultHost
-		}
-
-		if p, err := strconv.Atoi(hostParts[1]); err == nil && p != 0 {
-			port = p
-		} else {
-			return "", fmt.Errorf("Invalid bind address format: %s", addr)
-		}
-
-	} else if proto == "tcp" && !strings.Contains(addr, ":") {
-		return "", fmt.Errorf("Invalid bind address format: %s", addr)
-	} else {
-		host = addr
-	}
-	if proto == "unix" {
-		return fmt.Sprintf("%s://%s", proto, host), nil
-	}
-	return fmt.Sprintf("%s://%s:%d", proto, host, port), nil
-}
-
-// Get a repos name and returns the right reposName + tag
-// The tag can be confusing because of a port in a repository name.
-//     Ex: localhost.localdomain:5000/samalba/hipache:latest
-func ParseRepositoryTag(repos string) (string, string) {
-	n := strings.LastIndex(repos, ":")
-	if n < 0 {
-		return repos, ""
-	}
-	if tag := repos[n+1:]; !strings.Contains(tag, "/") {
-		return repos[:n], tag
-	}
-	return repos, ""
+// RemoveLocalDns looks into the /etc/resolv.conf,
+// and removes any local nameserver entries.
+func RemoveLocalDns(resolvConf []byte) []byte {
+	return localHostRx.ReplaceAll(resolvConf, []byte{})
 }
 
 // An StatusError reports an unsuccessful exit by a command.
@@ -697,27 +357,6 @@ func ShellQuoteArguments(args []string) string {
 		quote(arg, &buf)
 	}
 	return buf.String()
-}
-
-func PartParser(template, data string) (map[string]string, error) {
-	// ip:public:private
-	var (
-		templateParts = strings.Split(template, ":")
-		parts         = strings.Split(data, ":")
-		out           = make(map[string]string, len(templateParts))
-	)
-	if len(parts) != len(templateParts) {
-		return nil, fmt.Errorf("Invalid format to parse.  %s should match template %s", data, template)
-	}
-
-	for i, t := range templateParts {
-		value := ""
-		if len(parts) > i {
-			value = parts[i]
-		}
-		out[t] = value
-	}
-	return out, nil
 }
 
 var globalTestID string
@@ -777,22 +416,6 @@ func CopyFile(src, dst string) (int64, error) {
 	return io.Copy(df, sf)
 }
 
-type readCloserWrapper struct {
-	io.Reader
-	closer func() error
-}
-
-func (r *readCloserWrapper) Close() error {
-	return r.closer()
-}
-
-func NewReadCloserWrapper(r io.Reader, closer func() error) io.ReadCloser {
-	return &readCloserWrapper{
-		Reader: r,
-		closer: closer,
-	}
-}
-
 // ReplaceOrAppendValues returns the defaults with the overrides either
 // replaced by env key or appended to the list
 func ReplaceOrAppendEnvValues(defaults, overrides []string) []string {
@@ -833,14 +456,6 @@ func ReadSymlinkedDirectory(path string) (string, error) {
 	return realPath, nil
 }
 
-func ParseKeyValueOpt(opt string) (string, string, error) {
-	parts := strings.SplitN(opt, "=", 2)
-	if len(parts) != 2 {
-		return "", "", fmt.Errorf("Unable to parse key/value option: %s", opt)
-	}
-	return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), nil
-}
-
 // TreeSize walks a directory tree and returns its total size in bytes.
 func TreeSize(dir string) (size int64, err error) {
 	data := make(map[uint64]struct{})
@@ -874,36 +489,52 @@ func TreeSize(dir string) (size int64, err error) {
 // ValidateContextDirectory checks if all the contents of the directory
 // can be read and returns an error if some files can't be read
 // symlinks which point to non-existing files don't trigger an error
-func ValidateContextDirectory(srcPath string) error {
-	var finalError error
-
-	filepath.Walk(filepath.Join(srcPath, "."), func(filePath string, f os.FileInfo, err error) error {
+func ValidateContextDirectory(srcPath string, excludes []string) error {
+	return filepath.Walk(filepath.Join(srcPath, "."), func(filePath string, f os.FileInfo, err error) error {
 		// skip this directory/file if it's not in the path, it won't get added to the context
-		_, err = filepath.Rel(srcPath, filePath)
-		if err != nil && os.IsPermission(err) {
+		if relFilePath, err := filepath.Rel(srcPath, filePath); err != nil {
+			return err
+		} else if skip, err := fileutils.Matches(relFilePath, excludes); err != nil {
+			return err
+		} else if skip {
+			if f.IsDir() {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 
-		if _, err := os.Stat(filePath); err != nil && os.IsPermission(err) {
-			finalError = fmt.Errorf("can't stat '%s'", filePath)
+		if err != nil {
+			if os.IsPermission(err) {
+				return fmt.Errorf("can't stat '%s'", filePath)
+			}
+			if os.IsNotExist(err) {
+				return nil
+			}
 			return err
 		}
+
 		// skip checking if symlinks point to non-existing files, such symlinks can be useful
-		lstat, _ := os.Lstat(filePath)
-		if lstat.Mode()&os.ModeSymlink == os.ModeSymlink {
-			return err
+		// also skip named pipes, because they hanging on open
+		if f.Mode()&(os.ModeSymlink|os.ModeNamedPipe) != 0 {
+			return nil
 		}
 
 		if !f.IsDir() {
 			currentFile, err := os.Open(filePath)
 			if err != nil && os.IsPermission(err) {
-				finalError = fmt.Errorf("no permission to read from '%s'", filePath)
-				return err
-			} else {
-				currentFile.Close()
+				return fmt.Errorf("no permission to read from '%s'", filePath)
 			}
+			currentFile.Close()
 		}
 		return nil
 	})
-	return finalError
+}
+
+func StringsContainsNoCase(slice []string, s string) bool {
+	for _, ss := range slice {
+		if strings.ToLower(s) == strings.ToLower(ss) {
+			return true
+		}
+	}
+	return false
 }

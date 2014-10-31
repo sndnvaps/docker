@@ -1,3 +1,5 @@
+// +build linux,cgo
+
 package native
 
 import (
@@ -6,14 +8,13 @@ import (
 	"os/exec"
 	"path/filepath"
 
+	"github.com/docker/docker/daemon/execdriver"
+	"github.com/docker/docker/daemon/execdriver/native/template"
 	"github.com/docker/libcontainer"
 	"github.com/docker/libcontainer/apparmor"
 	"github.com/docker/libcontainer/devices"
 	"github.com/docker/libcontainer/mount"
 	"github.com/docker/libcontainer/security/capabilities"
-	"github.com/dotcloud/docker/daemon/execdriver"
-	"github.com/dotcloud/docker/daemon/execdriver/native/configuration"
-	"github.com/dotcloud/docker/daemon/execdriver/native/template"
 )
 
 // createContainer populates and configures the container type with the
@@ -21,14 +22,15 @@ import (
 func (d *driver) createContainer(c *execdriver.Command) (*libcontainer.Config, error) {
 	container := template.New()
 
-	container.Hostname = getEnv("HOSTNAME", c.Env)
-	container.Tty = c.Tty
-	container.User = c.User
+	container.Hostname = getEnv("HOSTNAME", c.ProcessConfig.Env)
+	container.Tty = c.ProcessConfig.Tty
+	container.User = c.ProcessConfig.User
 	container.WorkingDir = c.WorkingDir
-	container.Env = c.Env
+	container.Env = c.ProcessConfig.Env
 	container.Cgroups.Name = c.ID
 	container.Cgroups.AllowedDevices = c.AllowedDevices
 	container.MountConfig.DeviceNodes = c.AutoCreatedDevices
+	container.RootFs = c.Rootfs
 
 	// check to see if we are running in ramdisk to disable pivot root
 	container.MountConfig.NoPivotRoot = os.Getenv("DOCKER_RAMDISK") != ""
@@ -38,10 +40,18 @@ func (d *driver) createContainer(c *execdriver.Command) (*libcontainer.Config, e
 		return nil, err
 	}
 
-	if c.Privileged {
+	if c.ProcessConfig.Privileged {
 		if err := d.setPrivileged(container); err != nil {
 			return nil, err
 		}
+	} else {
+		if err := d.setCapabilities(container, c); err != nil {
+			return nil, err
+		}
+	}
+
+	if c.AppArmorProfile != "" {
+		container.AppArmorProfile = c.AppArmorProfile
 	}
 
 	if err := d.setupCgroups(container, c); err != nil {
@@ -62,10 +72,6 @@ func (d *driver) createContainer(c *execdriver.Command) (*libcontainer.Config, e
 		cmds[k] = v.cmd
 	}
 	d.Unlock()
-
-	if err := configuration.ParseConfiguration(container, cmds, c.Config["native"]); err != nil {
-		return nil, err
-	}
 
 	return container, nil
 }
@@ -89,6 +95,7 @@ func (d *driver) createNetwork(container *libcontainer.Config, c *execdriver.Com
 		vethNetwork := libcontainer.Network{
 			Mtu:        c.Network.Mtu,
 			Address:    fmt.Sprintf("%s/%d", c.Network.Interface.IPAddress, c.Network.Interface.IPPrefixLen),
+			MacAddress: c.Network.Interface.MacAddress,
 			Gateway:    c.Network.Interface.Gateway,
 			Type:       "veth",
 			Bridge:     c.Network.Interface.Bridge,
@@ -136,6 +143,11 @@ func (d *driver) setPrivileged(container *libcontainer.Config) (err error) {
 	return nil
 }
 
+func (d *driver) setCapabilities(container *libcontainer.Config, c *execdriver.Command) (err error) {
+	container.Capabilities, err = execdriver.TweakCapabilities(container.Capabilities, c.CapAdd, c.CapDrop)
+	return err
+}
+
 func (d *driver) setupCgroups(container *libcontainer.Config, c *execdriver.Command) error {
 	if c.Resources != nil {
 		container.Cgroups.CpuShares = c.Resources.CpuShares
@@ -150,12 +162,13 @@ func (d *driver) setupCgroups(container *libcontainer.Config, c *execdriver.Comm
 
 func (d *driver) setupMounts(container *libcontainer.Config, c *execdriver.Command) error {
 	for _, m := range c.Mounts {
-		container.MountConfig.Mounts = append(container.MountConfig.Mounts, mount.Mount{
+		container.MountConfig.Mounts = append(container.MountConfig.Mounts, &mount.Mount{
 			Type:        "bind",
 			Source:      m.Source,
 			Destination: m.Destination,
 			Writable:    m.Writable,
 			Private:     m.Private,
+			Slave:       m.Slave,
 		})
 	}
 
@@ -163,8 +176,8 @@ func (d *driver) setupMounts(container *libcontainer.Config, c *execdriver.Comma
 }
 
 func (d *driver) setupLabels(container *libcontainer.Config, c *execdriver.Command) error {
-	container.ProcessLabel = c.Config["process_label"][0]
-	container.MountConfig.MountLabel = c.Config["mount_label"][0]
+	container.ProcessLabel = c.ProcessLabel
+	container.MountConfig.MountLabel = c.MountLabel
 
 	return nil
 }

@@ -29,8 +29,10 @@ To install the latest Ubuntu package (may not be the latest Docker release):
 
     $ sudo apt-get update
     $ sudo apt-get install docker.io
-    $ sudo ln -sf /usr/bin/docker.io /usr/local/bin/docker
-    $ sudo sed -i '$acomplete -F _docker docker' /etc/bash_completion.d/docker.io
+
+Then, to enable tab-completion of Docker commands in BASH, either restart BASH or:
+
+    $ source /etc/bash_completion.d/docker.io
 
 If you'd like to try the latest version of Docker:
 
@@ -54,7 +56,7 @@ the `lxc-docker` package.
 *You may receive a warning that the package isn't trusted. Answer yes to
 continue installation.*
 
-    $ sudo sh -c "echo deb https://get.docker.io/ubuntu docker main\
+    $ sudo sh -c "echo deb https://get.docker.com/ubuntu docker main\
     > /etc/apt/sources.list.d/docker.list"
     $ sudo apt-get update
     $ sudo apt-get install lxc-docker
@@ -63,7 +65,7 @@ continue installation.*
 >
 > There is also a simple `curl` script available to help with this process.
 >
->     $ curl -s https://get.docker.io/ubuntu/ | sudo sh
+>     $ curl -sSL https://get.docker.com/ubuntu/ | sudo sh
 
 To verify that everything has worked as expected:
 
@@ -87,9 +89,18 @@ VirtualBox guest additions. If you didn't install the headers for your
 "precise" kernel, then you can skip these headers for the "raring"
 kernel. But it is safer to include them if you're not sure.
 
+Please read the installation instructions for backported kernels at
+Ubuntu.org to understand why you also need to install the Xorg packages
+when running Docker on a machine with a graphical environment like Unity.
+[LTS Enablement Stack](https://wiki.ubuntu.com/Kernel/LTSEnablementStack) refer to note 5 under
+each version.
+
     # install the backported kernel
     $ sudo apt-get update
     $ sudo apt-get install linux-image-generic-lts-raring linux-headers-generic-lts-raring
+    
+    # install the backported kernel and xorg if using Unity/Xorg
+    $ sudo apt-get install --install-recommends linux-generic-lts-raring xserver-xorg-lts-raring libgl1-mesa-glx-lts-raring
 
     # reboot
     $ sudo reboot
@@ -125,7 +136,7 @@ the `lxc-docker` package.
 *You may receive a warning that the package isn't trusted. Answer yes to
 continue installation.*
 
-    $ sudo sh -c "echo deb https://get.docker.io/ubuntu docker main\
+    $ sudo sh -c "echo deb https://get.docker.com/ubuntu docker main\
     > /etc/apt/sources.list.d/docker.list"
     $ sudo apt-get update
     $ sudo apt-get install lxc-docker
@@ -134,7 +145,7 @@ continue installation.*
 > 
 > There is also a simple `curl` script available to help with this process.
 > 
->     $ curl -s https://get.docker.io/ubuntu/ | sudo sh
+>     $ curl -sSL https://get.docker.com/ubuntu/ | sudo sh
 
 Now verify that the installation has worked by downloading the
 `ubuntu` image and launching a container.
@@ -178,7 +189,7 @@ First add the Docker repository key to your local keychain.
 Add the Docker repository to your apt sources list, update and install
 the `lxc-docker` package.
 
-    $ sudo sh -c "echo deb http://get.docker.io/ubuntu docker main\
+    $ sudo sh -c "echo deb http://get.docker.com/ubuntu docker main\
     > /etc/apt/sources.list.d/docker.list"
     $ sudo apt-get update
     $ sudo apt-get install lxc-docker
@@ -192,7 +203,18 @@ Type `exit` to exit
 
 **Done!**, now continue with the [User Guide](/userguide/).
 
-### Giving non-root access
+### Upgrade
+
+To install the latest version of Docker, use the standard
+`apt-get` method:
+
+    # update your sources list
+    $ sudo apt-get update
+
+    # install the latest
+    $ sudo apt-get install lxc-docker
+
+## Giving non-root access
 
 The `docker` daemon always runs as the `root` user, and since Docker
 version 0.5.2, the `docker` daemon binds to a Unix socket instead of a
@@ -211,7 +233,7 @@ alternative group.
 > **Warning**: 
 > The `docker` group (or the group specified with the `-G` flag) is
 > `root`-equivalent; see [*Docker Daemon Attack Surface*](
-> /articles/security/#dockersecurity-daemon) details.
+> /articles/security/#dockersecurity-daemon) for details.
 
 **Example:**
 
@@ -227,17 +249,6 @@ alternative group.
     # Restart the Docker daemon.
     # If you are in Ubuntu 14.04, use docker.io instead of docker
     $ sudo service docker restart
-
-### Upgrade
-
-To install the latest version of docker, use the standard
-`apt-get` method:
-
-    # update your sources list
-    $ sudo apt-get update
-
-    # install the latest
-    $ sudo apt-get install lxc-docker
 
 ## Memory and Swap Accounting
 
@@ -266,11 +277,11 @@ These parameters will help you get rid of the following warnings:
 
 ## Troubleshooting
 
-On Linux Mint, the `cgroup-lite` package is not
+On Linux Mint, the `cgroup-lite` and `apparmor` packages are not
 installed by default. Before Docker will work correctly, you will need
 to install this via:
 
-    $ sudo apt-get update && sudo apt-get install cgroup-lite
+    $ sudo apt-get update && sudo apt-get install cgroup-lite apparmor
 
 ## Docker and UFW
 
@@ -347,7 +358,7 @@ NetworkManager and Docker need to be restarted afterwards:
 
 ## Mirrors
 
-You should `ping get.docker.io` and compare the
+You should `ping get.docker.com` and compare the
 latency to the following mirrors, and pick whichever one is best for
 you.
 
@@ -356,7 +367,7 @@ you.
 [Yandex](http://yandex.ru/) in Russia is mirroring the Docker Debian
 packages, updating every 6 hours.
 Substitute `http://mirror.yandex.ru/mirrors/docker/` for
-`http://get.docker.io/ubuntu` in the instructions above.
+`http://get.docker.com/ubuntu` in the instructions above.
 For example:
 
     $ sudo sh -c "echo deb http://mirror.yandex.ru/mirrors/docker/ docker main\

@@ -113,6 +113,23 @@ else
 	echo "    $(wrap_color '(see https://github.com/tianon/cgroupfs-mount)' yellow)"
 fi
 
+if [ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)" = 'Y' ]; then
+	echo -n '- '
+	if command -v apparmor_parser &> /dev/null; then
+		echo "$(wrap_good 'apparmor' 'enabled and tools installed')"
+	else
+		echo "$(wrap_bad 'apparmor' 'enabled, but apparmor_parser missing')"
+		echo -n '    '
+		if command -v apt-get &> /dev/null; then
+			echo "$(wrap_color '(use "apt-get install apparmor" to fix this)')"
+		elif command -v yum &> /dev/null; then
+			echo "$(wrap_color '(your best bet is "yum install apparmor-parser")')"
+		else
+			echo "$(wrap_color '(look for an "apparmor" package for your distribution)')"
+		fi
+	fi
+fi
+
 flags=(
 	NAMESPACES {NET,PID,IPC,UTS}_NS
 	DEVPTS_MULTIPLE_INSTANCES
@@ -129,13 +146,14 @@ echo 'Optional Features:'
 flags=(
 	MEMCG_SWAP
 	RESOURCE_COUNTERS
+	CGROUP_PERF
 )
 check_flags "${flags[@]}"
 
 echo '- Storage Drivers:'
 {
 	echo '- "'$(wrap_color 'aufs' blue)'":'
-	check_flags AUFS_FS | sed 's/^/  /'
+	check_flags AUFS_FS EXT4_FS_POSIX_ACL EXT4_FS_SECURITY | sed 's/^/  /'
 	if ! is_set AUFS_FS && grep -q aufs /proc/filesystems; then
 		echo "    $(wrap_color '(note that some kernels include AUFS patches but not the AUFS_FS flag)' bold black)"
 	fi
@@ -144,7 +162,7 @@ echo '- Storage Drivers:'
 	check_flags BTRFS_FS | sed 's/^/  /'
 
 	echo '- "'$(wrap_color 'devicemapper' blue)'":'
-	check_flags BLK_DEV_DM DM_THIN_PROVISIONING EXT4_FS | sed 's/^/  /'
+	check_flags BLK_DEV_DM DM_THIN_PROVISIONING EXT4_FS EXT4_FS_POSIX_ACL EXT4_FS_SECURITY | sed 's/^/  /'
 } | sed 's/^/  /'
 echo
 

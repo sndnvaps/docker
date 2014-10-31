@@ -2,6 +2,7 @@ package fs
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -9,12 +10,12 @@ import (
 	"github.com/docker/libcontainer/cgroups"
 )
 
-type memoryGroup struct {
+type MemoryGroup struct {
 }
 
-func (s *memoryGroup) Set(d *data) error {
+func (s *MemoryGroup) Set(d *data) error {
 	dir, err := d.join("memory")
-	// only return an error for memory if it was not specified
+	// only return an error for memory if it was specified
 	if err != nil && (d.c.Memory != 0 || d.c.MemoryReservation != 0 || d.c.MemorySwap != 0) {
 		return err
 	}
@@ -47,19 +48,17 @@ func (s *memoryGroup) Set(d *data) error {
 	return nil
 }
 
-func (s *memoryGroup) Remove(d *data) error {
+func (s *MemoryGroup) Remove(d *data) error {
 	return removePath(d.path("memory"))
 }
 
-func (s *memoryGroup) GetStats(d *data, stats *cgroups.Stats) error {
-	path, err := d.path("memory")
-	if err != nil {
-		return err
-	}
-
+func (s *MemoryGroup) GetStats(path string, stats *cgroups.Stats) error {
 	// Set stats from memory.stat.
 	statsFile, err := os.Open(filepath.Join(path, "memory.stat"))
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
 		return err
 	}
 	defer statsFile.Close()
@@ -68,25 +67,25 @@ func (s *memoryGroup) GetStats(d *data, stats *cgroups.Stats) error {
 	for sc.Scan() {
 		t, v, err := getCgroupParamKeyValue(sc.Text())
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to parse memory.stat (%q) - %v", sc.Text(), err)
 		}
 		stats.MemoryStats.Stats[t] = v
 	}
 
 	// Set memory usage and max historical usage.
-	value, err := getCgroupParamInt(path, "memory.usage_in_bytes")
+	value, err := getCgroupParamUint(path, "memory.usage_in_bytes")
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to parse memory.usage_in_bytes - %v", err)
 	}
 	stats.MemoryStats.Usage = value
-	value, err = getCgroupParamInt(path, "memory.max_usage_in_bytes")
+	value, err = getCgroupParamUint(path, "memory.max_usage_in_bytes")
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to parse memory.max_usage_in_bytes - %v", err)
 	}
 	stats.MemoryStats.MaxUsage = value
-	value, err = getCgroupParamInt(path, "memory.failcnt")
+	value, err = getCgroupParamUint(path, "memory.failcnt")
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to parse memory.failcnt - %v", err)
 	}
 	stats.MemoryStats.Failcnt = value
 

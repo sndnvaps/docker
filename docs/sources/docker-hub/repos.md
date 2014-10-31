@@ -11,7 +11,7 @@ page_keywords: Docker, docker, registry, accounts, plans, Dockerfile, Docker Hub
 You can `search` for all the publicly available repositories and images using
 Docker.
 
-    $ docker search ubuntu
+    $ sudo docker search ubuntu
 
 This will show you a list of the currently available repositories on the
 Docker Hub which match the provided keyword.
@@ -65,9 +65,9 @@ optimized and up-to-date image to power your applications.
 > **Note:**
 > If you would like to contribute an official repository for your
 > organization, product or team you can see more information
-> [here](https://github.com/dotcloud/stackbrew).
+> [here](https://github.com/docker/stackbrew).
 
-## Private Docker Repositories
+## Private Repositories
 
 Private repositories allow you to have repositories that contain images
 that you want to keep private, either to your own account or within an

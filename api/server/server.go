@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -21,16 +20,19 @@ import (
 	"syscall"
 
 	"code.google.com/p/go.net/websocket"
-
-	"github.com/dotcloud/docker/api"
-	"github.com/dotcloud/docker/engine"
-	"github.com/dotcloud/docker/pkg/listenbuffer"
-	"github.com/dotcloud/docker/pkg/systemd"
-	"github.com/dotcloud/docker/pkg/user"
-	"github.com/dotcloud/docker/pkg/version"
-	"github.com/dotcloud/docker/registry"
-	"github.com/dotcloud/docker/utils"
+	"github.com/docker/libcontainer/user"
 	"github.com/gorilla/mux"
+
+	log "github.com/Sirupsen/logrus"
+	"github.com/docker/docker/api"
+	"github.com/docker/docker/engine"
+	"github.com/docker/docker/pkg/listenbuffer"
+	"github.com/docker/docker/pkg/parsers"
+	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/docker/docker/pkg/systemd"
+	"github.com/docker/docker/pkg/version"
+	"github.com/docker/docker/registry"
+	"github.com/docker/docker/utils"
 )
 
 var (
@@ -47,6 +49,24 @@ func hijackServer(w http.ResponseWriter) (io.ReadCloser, io.Writer, error) {
 	// Flush the options to make sure the client sets the raw mode
 	conn.Write([]byte{})
 	return conn, conn, nil
+}
+
+// Check to make sure request's Content-Type is application/json
+func checkForJson(r *http.Request) error {
+	ct := r.Header.Get("Content-Type")
+
+	// No Content-Type header is ok as long as there's no Body
+	if ct == "" {
+		if r.Body == nil || r.ContentLength == 0 {
+			return nil
+		}
+	}
+
+	// Otherwise it better be json
+	if api.MatchesContentType(ct, "application/json") {
+		return nil
+	}
+	return fmt.Errorf("Content-Type specified (%s) must be 'application/json'", ct)
 }
 
 //If we don't do this, POST method without Content-type (even with empty body) will fail
@@ -72,22 +92,23 @@ func httpError(w http.ResponseWriter, err error) {
 	// FIXME: this is brittle and should not be necessary.
 	// If we need to differentiate between different possible error types, we should
 	// create appropriate error types with clearly defined meaning.
-	if strings.Contains(err.Error(), "No such") {
+	errStr := strings.ToLower(err.Error())
+	if strings.Contains(errStr, "no such") {
 		statusCode = http.StatusNotFound
-	} else if strings.Contains(err.Error(), "Bad parameter") {
+	} else if strings.Contains(errStr, "bad parameter") {
 		statusCode = http.StatusBadRequest
-	} else if strings.Contains(err.Error(), "Conflict") {
+	} else if strings.Contains(errStr, "conflict") {
 		statusCode = http.StatusConflict
-	} else if strings.Contains(err.Error(), "Impossible") {
+	} else if strings.Contains(errStr, "impossible") {
 		statusCode = http.StatusNotAcceptable
-	} else if strings.Contains(err.Error(), "Wrong login/password") {
+	} else if strings.Contains(errStr, "wrong login/password") {
 		statusCode = http.StatusUnauthorized
-	} else if strings.Contains(err.Error(), "hasn't been activated") {
+	} else if strings.Contains(errStr, "hasn't been activated") {
 		statusCode = http.StatusForbidden
 	}
 
 	if err != nil {
-		utils.Errorf("HTTP Error: statusCode=%d %s", statusCode, err.Error())
+		log.Errorf("HTTP Error: statusCode=%d %s", statusCode, err.Error())
 		http.Error(w, err.Error(), statusCode)
 	}
 }
@@ -237,10 +258,10 @@ func getImagesJSON(eng *engine.Engine, version version.Version, w http.ResponseW
 		outsLegacy := engine.NewTable("Created", 0)
 		for _, out := range outs.Data {
 			for _, repoTag := range out.GetList("RepoTags") {
-				parts := strings.Split(repoTag, ":")
+				repo, tag := parsers.ParseRepositoryTag(repoTag)
 				outLegacy := &engine.Env{}
-				outLegacy.Set("Repository", parts[0])
-				outLegacy.Set("Tag", parts[1])
+				outLegacy.Set("Repository", repo)
+				outLegacy.SetJson("Tag", tag)
 				outLegacy.Set("Id", out.Get("Id"))
 				outLegacy.SetInt64("Created", out.GetInt64("Created"))
 				outLegacy.SetInt64("Size", out.GetInt64("Size"))
@@ -301,7 +322,7 @@ func getContainersChanges(eng *engine.Engine, version version.Version, w http.Re
 	if vars == nil {
 		return fmt.Errorf("Missing parameter")
 	}
-	var job = eng.Job("changes", vars["name"])
+	var job = eng.Job("container_changes", vars["name"])
 	streamJSON(job, w, false)
 
 	return job.Run()
@@ -338,6 +359,7 @@ func getContainersJSON(eng *engine.Engine, version version.Version, w http.Respo
 	job.Setenv("since", r.Form.Get("since"))
 	job.Setenv("before", r.Form.Get("before"))
 	job.Setenv("limit", r.Form.Get("limit"))
+	job.Setenv("filters", r.Form.Get("filters"))
 
 	if version.GreaterThanOrEqualTo("1.5") {
 		streamJSON(job, w, false)
@@ -395,8 +417,8 @@ func getContainersLogs(eng *engine.Engine, version version.Version, w http.Respo
 	outStream = utils.NewWriteFlusher(w)
 
 	if c.GetSubEnv("Config") != nil && !c.GetSubEnv("Config").GetBool("Tty") && version.GreaterThanOrEqualTo("1.6") {
-		errStream = utils.NewStdWriter(outStream, utils.Stderr)
-		outStream = utils.NewStdWriter(outStream, utils.Stdout)
+		errStream = stdcopy.NewStdWriter(outStream, stdcopy.Stderr)
+		outStream = stdcopy.NewStdWriter(outStream, stdcopy.Stdout)
 	} else {
 		errStream = outStream
 	}
@@ -436,8 +458,13 @@ func postCommit(eng *engine.Engine, version version.Version, w http.ResponseWrit
 		job          = eng.Job("commit", r.Form.Get("container"))
 		stdoutBuffer = bytes.NewBuffer(nil)
 	)
+
+	if err := checkForJson(r); err != nil {
+		return err
+	}
+
 	if err := config.Decode(r.Body); err != nil {
-		utils.Errorf("%s", err)
+		log.Errorf("%s", err)
 	}
 
 	if r.FormValue("pause") == "" && version.GreaterThanOrEqualTo("1.13") {
@@ -468,6 +495,7 @@ func postImagesCreate(eng *engine.Engine, version version.Version, w http.Respon
 
 	var (
 		image = r.Form.Get("fromImage")
+		repo  = r.Form.Get("repo")
 		tag   = r.Form.Get("tag")
 		job   *engine.Job
 	)
@@ -482,18 +510,24 @@ func postImagesCreate(eng *engine.Engine, version version.Version, w http.Respon
 		}
 	}
 	if image != "" { //pull
+		if tag == "" {
+			image, tag = parsers.ParseRepositoryTag(image)
+		}
 		metaHeaders := map[string][]string{}
 		for k, v := range r.Header {
 			if strings.HasPrefix(k, "X-Meta-") {
 				metaHeaders[k] = v
 			}
 		}
-		job = eng.Job("pull", r.Form.Get("fromImage"), tag)
+		job = eng.Job("pull", image, tag)
 		job.SetenvBool("parallel", version.GreaterThan("1.3"))
 		job.SetenvJson("metaHeaders", metaHeaders)
 		job.SetenvJson("authConfig", authConfig)
 	} else { //import
-		job = eng.Job("import", r.Form.Get("fromSrc"), r.Form.Get("repo"), tag)
+		if tag == "" {
+			repo, tag = parsers.ParseRepositoryTag(repo)
+		}
+		job = eng.Job("import", r.Form.Get("fromSrc"), repo, tag)
 		job.Stdin.Add(r.Body)
 	}
 
@@ -602,10 +636,18 @@ func getImagesGet(eng *engine.Engine, version version.Version, w http.ResponseWr
 	if vars == nil {
 		return fmt.Errorf("Missing parameter")
 	}
+	if err := parseForm(r); err != nil {
+		return err
+	}
 	if version.GreaterThan("1.0") {
 		w.Header().Set("Content-Type", "application/x-tar")
 	}
-	job := eng.Job("image_export", vars["name"])
+	var job *engine.Job
+	if name, ok := vars["name"]; ok {
+		job = eng.Job("image_export", name)
+	} else {
+		job = eng.Job("image_export", r.Form["names"]...)
+	}
 	job.Stdout.Add(w)
 	return job.Run()
 }
@@ -627,6 +669,11 @@ func postContainersCreate(eng *engine.Engine, version version.Version, w http.Re
 		stdoutBuffer = bytes.NewBuffer(nil)
 		warnings     = bytes.NewBuffer(nil)
 	)
+
+	if err := checkForJson(r); err != nil {
+		return err
+	}
+
 	if err := job.DecodeEnv(r.Body); err != nil {
 		return err
 	}
@@ -644,6 +691,7 @@ func postContainersCreate(eng *engine.Engine, version version.Version, w http.Re
 	}
 	out.Set("Id", engine.Tail(stdoutBuffer, 1))
 	out.SetList("Warnings", outWarnings)
+
 	return writeJSON(w, http.StatusCreated, out)
 }
 
@@ -670,10 +718,12 @@ func deleteContainers(eng *engine.Engine, version version.Version, w http.Respon
 	if vars == nil {
 		return fmt.Errorf("Missing parameter")
 	}
-	job := eng.Job("container_delete", vars["name"])
+	job := eng.Job("rm", vars["name"])
+
+	job.Setenv("forceRemove", r.Form.Get("force"))
+
 	job.Setenv("removeVolume", r.Form.Get("v"))
 	job.Setenv("removeLink", r.Form.Get("link"))
-	job.Setenv("forceRemove", r.Form.Get("force"))
 	if err := job.Run(); err != nil {
 		return err
 	}
@@ -705,14 +755,22 @@ func postContainersStart(eng *engine.Engine, version version.Version, w http.Res
 		job  = eng.Job("start", name)
 	)
 
+	// If contentLength is -1, we can assumed chunked encoding
+	// or more technically that the length is unknown
+	// http://golang.org/src/pkg/net/http/request.go#L139
+	// net/http otherwise seems to swallow any headers related to chunked encoding
+	// including r.TransferEncoding
 	// allow a nil body for backwards compatibility
-	if r.Body != nil {
-		if api.MatchesContentType(r.Header.Get("Content-Type"), "application/json") {
-			if err := job.DecodeEnv(r.Body); err != nil {
-				return err
-			}
+	if r.Body != nil && (r.ContentLength > 0 || r.ContentLength == -1) {
+		if err := checkForJson(r); err != nil {
+			return err
+		}
+
+		if err := job.DecodeEnv(r.Body); err != nil {
+			return err
 		}
 	}
+
 	if err := job.Run(); err != nil {
 		if err.Error() == "Container already started" {
 			w.WriteHeader(http.StatusNotModified)
@@ -818,8 +876,8 @@ func postContainersAttach(eng *engine.Engine, version version.Version, w http.Re
 	fmt.Fprintf(outStream, "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.docker.raw-stream\r\n\r\n")
 
 	if c.GetSubEnv("Config") != nil && !c.GetSubEnv("Config").GetBool("Tty") && version.GreaterThanOrEqualTo("1.6") {
-		errStream = utils.NewStdWriter(outStream, utils.Stderr)
-		outStream = utils.NewStdWriter(outStream, utils.Stdout)
+		errStream = stdcopy.NewStdWriter(outStream, stdcopy.Stderr)
+		outStream = stdcopy.NewStdWriter(outStream, stdcopy.Stdout)
 	} else {
 		errStream = outStream
 	}
@@ -864,7 +922,7 @@ func wsContainersAttach(eng *engine.Engine, version version.Version, w http.Resp
 		job.Stdout.Add(ws)
 		job.Stderr.Set(ws)
 		if err := job.Run(); err != nil {
-			utils.Errorf("Error attaching websocket: %s", err)
+			log.Errorf("Error attaching websocket: %s", err)
 		}
 	})
 	h.ServeHTTP(w, r)
@@ -970,12 +1028,12 @@ func postContainersCopy(eng *engine.Engine, version version.Version, w http.Resp
 
 	var copyData engine.Env
 
-	if contentType := r.Header.Get("Content-Type"); api.MatchesContentType(contentType, "application/json") {
-		if err := copyData.Decode(r.Body); err != nil {
-			return err
-		}
-	} else {
-		return fmt.Errorf("Content-Type not supported: %s", contentType)
+	if err := checkForJson(r); err != nil {
+		return err
+	}
+
+	if err := copyData.Decode(r.Body); err != nil {
+		return err
 	}
 
 	if copyData.Get("Resource") == "" {
@@ -990,13 +1048,115 @@ func postContainersCopy(eng *engine.Engine, version version.Version, w http.Resp
 
 	job := eng.Job("container_copy", vars["name"], copyData.Get("Resource"))
 	job.Stdout.Add(w)
+	w.Header().Set("Content-Type", "application/x-tar")
 	if err := job.Run(); err != nil {
-		utils.Errorf("%s", err.Error())
-		if strings.Contains(err.Error(), "No such container") {
+		log.Errorf("%s", err.Error())
+		if strings.Contains(strings.ToLower(err.Error()), "no such container") {
 			w.WriteHeader(http.StatusNotFound)
 		} else if strings.Contains(err.Error(), "no such file or directory") {
 			return fmt.Errorf("Could not find the file %s in container %s", origResource, vars["name"])
 		}
+	}
+	return nil
+}
+
+func postContainerExecCreate(eng *engine.Engine, version version.Version, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
+	if err := parseForm(r); err != nil {
+		return nil
+	}
+	var (
+		out          engine.Env
+		name         = vars["name"]
+		job          = eng.Job("execCreate", name)
+		stdoutBuffer = bytes.NewBuffer(nil)
+	)
+
+	if err := job.DecodeEnv(r.Body); err != nil {
+		return err
+	}
+
+	job.Stdout.Add(stdoutBuffer)
+	// Register an instance of Exec in container.
+	if err := job.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error setting up exec command in container %s: %s\n", name, err)
+		return err
+	}
+	// Return the ID
+	out.Set("Id", engine.Tail(stdoutBuffer, 1))
+
+	return writeJSON(w, http.StatusCreated, out)
+}
+
+// TODO(vishh): Refactor the code to avoid having to specify stream config as part of both create and start.
+func postContainerExecStart(eng *engine.Engine, version version.Version, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
+	if err := parseForm(r); err != nil {
+		return nil
+	}
+	var (
+		name             = vars["name"]
+		job              = eng.Job("execStart", name)
+		errOut io.Writer = os.Stderr
+	)
+
+	if err := job.DecodeEnv(r.Body); err != nil {
+		return err
+	}
+	if !job.GetenvBool("Detach") {
+		// Setting up the streaming http interface.
+		inStream, outStream, err := hijackServer(w)
+		if err != nil {
+			return err
+		}
+
+		defer func() {
+			if tcpc, ok := inStream.(*net.TCPConn); ok {
+				tcpc.CloseWrite()
+			} else {
+				inStream.Close()
+			}
+		}()
+		defer func() {
+			if tcpc, ok := outStream.(*net.TCPConn); ok {
+				tcpc.CloseWrite()
+			} else if closer, ok := outStream.(io.Closer); ok {
+				closer.Close()
+			}
+		}()
+
+		var errStream io.Writer
+
+		fmt.Fprintf(outStream, "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.docker.raw-stream\r\n\r\n")
+		if !job.GetenvBool("Tty") && version.GreaterThanOrEqualTo("1.6") {
+			errStream = stdcopy.NewStdWriter(outStream, stdcopy.Stderr)
+			outStream = stdcopy.NewStdWriter(outStream, stdcopy.Stdout)
+		} else {
+			errStream = outStream
+		}
+		job.Stdin.Add(inStream)
+		job.Stdout.Add(outStream)
+		job.Stderr.Set(errStream)
+		errOut = outStream
+	}
+	// Now run the user process in container.
+	job.SetCloseIO(false)
+	if err := job.Run(); err != nil {
+		fmt.Fprintf(errOut, "Error starting exec command in container %s: %s\n", name, err)
+		return err
+	}
+	w.WriteHeader(http.StatusNoContent)
+
+	return nil
+}
+
+func postContainerExecResize(eng *engine.Engine, version version.Version, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
+	if err := parseForm(r); err != nil {
+		return err
+	}
+	if vars == nil {
+		return fmt.Errorf("Missing parameter")
+	}
+	if err := eng.Job("execResize", vars["name"], r.Form.Get("h"), r.Form.Get("w")).Run(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1019,16 +1179,16 @@ func ping(eng *engine.Engine, version version.Version, w http.ResponseWriter, r 
 func makeHttpHandler(eng *engine.Engine, logging bool, localMethod string, localRoute string, handlerFunc HttpApiFunc, enableCors bool, dockerVersion version.Version) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// log the request
-		utils.Debugf("Calling %s %s", localMethod, localRoute)
+		log.Debugf("Calling %s %s", localMethod, localRoute)
 
 		if logging {
-			log.Println(r.Method, r.RequestURI)
+			log.Infof("%s %s", r.Method, r.RequestURI)
 		}
 
 		if strings.Contains(r.Header.Get("User-Agent"), "Docker-Client/") {
 			userAgent := strings.Split(r.Header.Get("User-Agent"), "/")
 			if len(userAgent) == 2 && !dockerVersion.Equal(version.Version(userAgent[1])) {
-				utils.Debugf("Warning: client and server don't have the same version (client: %s, server: %s)", userAgent[1], dockerVersion)
+				log.Debugf("Warning: client and server don't have the same version (client: %s, server: %s)", userAgent[1], dockerVersion)
 			}
 		}
 		version := version.Version(mux.Vars(r)["version"])
@@ -1045,7 +1205,7 @@ func makeHttpHandler(eng *engine.Engine, logging bool, localMethod string, local
 		}
 
 		if err := handlerFunc(eng, version, w, r, mux.Vars(r)); err != nil {
-			utils.Errorf("Error making handler: %s", err)
+			log.Errorf("Handler for %s %s returned error: %s", localMethod, localRoute, err)
 			httpError(w, err)
 		}
 	}
@@ -1091,6 +1251,7 @@ func createRouter(eng *engine.Engine, logging, enableCors bool, dockerVersion st
 			"/images/json":                    getImagesJSON,
 			"/images/viz":                     getImagesViz,
 			"/images/search":                  getImagesSearch,
+			"/images/get":                     getImagesGet,
 			"/images/{name:.*}/get":           getImagesGet,
 			"/images/{name:.*}/history":       getImagesHistory,
 			"/images/{name:.*}/json":          getImagesByName,
@@ -1122,6 +1283,9 @@ func createRouter(eng *engine.Engine, logging, enableCors bool, dockerVersion st
 			"/containers/{name:.*}/resize":  postContainersResize,
 			"/containers/{name:.*}/attach":  postContainersAttach,
 			"/containers/{name:.*}/copy":    postContainersCopy,
+			"/containers/{name:.*}/exec":    postContainerExecCreate,
+			"/exec/{name:.*}/start":         postContainerExecStart,
+			"/exec/{name:.*}/resize":        postContainerExecResize,
 		},
 		"DELETE": {
 			"/containers/{name:.*}": deleteContainers,
@@ -1134,7 +1298,7 @@ func createRouter(eng *engine.Engine, logging, enableCors bool, dockerVersion st
 
 	for method, routes := range m {
 		for route, fct := range routes {
-			utils.Debugf("Registering %s, %s", method, route)
+			log.Debugf("Registering %s, %s", method, route)
 			// NOTE: scope issue, make sure the variables are local and won't be changed
 			localRoute := route
 			localFct := fct
@@ -1181,7 +1345,7 @@ func ServeFd(addr string, handle http.Handler) error {
 	chErrors := make(chan error, len(ls))
 
 	// We don't want to start serving on these sockets until the
-	// "initserver" job has completed. Otherwise required handlers
+	// daemon is initialized and installed. Otherwise required handlers
 	// won't be ready.
 	<-activationLock
 
@@ -1195,7 +1359,7 @@ func ServeFd(addr string, handle http.Handler) error {
 		}()
 	}
 
-	for i := 0; i < len(ls); i += 1 {
+	for i := 0; i < len(ls); i++ {
 		err := <-chErrors
 		if err != nil {
 			return err
@@ -1224,7 +1388,7 @@ func changeGroup(addr string, nameOrGid string) error {
 		return err
 	}
 
-	utils.Debugf("%s group found. gid: %d", nameOrGid, gid)
+	log.Debugf("%s group found. gid: %d", nameOrGid, gid)
 	return os.Chown(addr, 0, gid)
 }
 
@@ -1276,6 +1440,8 @@ func ListenAndServe(proto, addr string, job *engine.Job) error {
 		tlsConfig := &tls.Config{
 			NextProtos:   []string{"http/1.1"},
 			Certificates: []tls.Certificate{cert},
+			// Avoid fallback on insecure SSL protocols
+			MinVersion: tls.VersionTLS10,
 		}
 		if job.GetenvBool("TlsVerify") {
 			certPool := x509.NewCertPool()
@@ -1295,7 +1461,7 @@ func ListenAndServe(proto, addr string, job *engine.Job) error {
 	switch proto {
 	case "tcp":
 		if !strings.HasPrefix(addr, "127.0.0.1") && !job.GetenvBool("TlsVerify") {
-			log.Println("/!\\ DON'T BIND ON ANOTHER IP ADDRESS THAN 127.0.0.1 IF YOU DON'T KNOW WHAT YOU'RE DOING /!\\")
+			log.Infof("/!\\ DON'T BIND ON ANOTHER IP ADDRESS THAN 127.0.0.1 IF YOU DON'T KNOW WHAT YOU'RE DOING /!\\")
 		}
 	case "unix":
 		socketGroup := job.Getenv("SocketGroup")
@@ -1303,11 +1469,12 @@ func ListenAndServe(proto, addr string, job *engine.Job) error {
 			if err := changeGroup(addr, socketGroup); err != nil {
 				if socketGroup == "docker" {
 					// if the user hasn't explicitly specified the group ownership, don't fail on errors.
-					utils.Debugf("Warning: could not chgrp %s to docker: %s", addr, err.Error())
+					log.Debugf("Warning: could not chgrp %s to docker: %s", addr, err.Error())
 				} else {
 					return err
 				}
 			}
+
 		}
 		if err := os.Chmod(addr, 0660); err != nil {
 			return err
@@ -1338,12 +1505,12 @@ func ServeApi(job *engine.Job) engine.Status {
 			return job.Errorf("usage: %s PROTO://ADDR [PROTO://ADDR ...]", job.Name)
 		}
 		go func() {
-			log.Printf("Listening for HTTP on %s (%s)\n", protoAddrParts[0], protoAddrParts[1])
+			log.Infof("Listening for HTTP on %s (%s)", protoAddrParts[0], protoAddrParts[1])
 			chErrors <- ListenAndServe(protoAddrParts[0], protoAddrParts[1], job)
 		}()
 	}
 
-	for i := 0; i < len(protoAddrs); i += 1 {
+	for i := 0; i < len(protoAddrs); i++ {
 		err := <-chErrors
 		if err != nil {
 			return job.Error(err)

@@ -23,8 +23,9 @@ func TestCpuStats(t *testing.T) {
 		"cpu.stat": cpuStatContent,
 	})
 
-	cpu := &cpuGroup{}
-	err := cpu.GetStats(helper.CgroupData, &actualStats)
+	cpu := &CpuGroup{}
+	actualStats := *cgroups.NewStats()
+	err := cpu.GetStats(helper.CgroupPath, &actualStats)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,8 +42,9 @@ func TestNoCpuStatFile(t *testing.T) {
 	helper := NewCgroupTestUtil("cpu", t)
 	defer helper.cleanup()
 
-	cpu := &cpuGroup{}
-	err := cpu.GetStats(helper.CgroupData, &actualStats)
+	cpu := &CpuGroup{}
+	actualStats := *cgroups.NewStats()
+	err := cpu.GetStats(helper.CgroupPath, &actualStats)
 	if err != nil {
 		t.Fatal("Expected not to fail, but did")
 	}
@@ -58,8 +60,9 @@ func TestInvalidCpuStat(t *testing.T) {
 		"cpu.stat": cpuStatContent,
 	})
 
-	cpu := &cpuGroup{}
-	err := cpu.GetStats(helper.CgroupData, &actualStats)
+	cpu := &CpuGroup{}
+	actualStats := *cgroups.NewStats()
+	err := cpu.GetStats(helper.CgroupPath, &actualStats)
 	if err == nil {
 		t.Fatal("Expected failed stat parsing.")
 	}

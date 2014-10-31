@@ -79,7 +79,7 @@ Docker uses a client-server architecture. The Docker *client* talks to the
 Docker *daemon*, which does the heavy lifting of building, running, and
 distributing your Docker containers. Both the Docker client and the daemon *can*
 run on the same system, or you can connect a Docker client to a remote Docker
-daemon. The Docker client and service communicate via sockets or through a
+daemon. The Docker client and daemon communicate via sockets or through a
 RESTful API.
 
 ![Docker Architecture Diagram](/article-img/architecture.svg)
@@ -157,7 +157,7 @@ this as the base of all your web application images.
 
 > **Note:** Docker usually gets these base images from
 > [Docker Hub](https://hub.docker.com).
-> 
+
 Docker images are then built from these base images using a simple, descriptive
 set of steps we call *instructions*. Each instruction creates a new layer in our
 image. Instructions include actions like:
@@ -198,7 +198,7 @@ then run.
 Either by using the `docker` binary or via the API, the Docker client tells the Docker
 daemon to run a container.
 
-    $ docker run -i -t ubuntu /bin/bash
+    $ sudo docker run -i -t ubuntu /bin/bash
 
 Let's break down this command. The Docker client is launched using the `docker`
 binary with the `run` option telling it to launch a new container. The bare

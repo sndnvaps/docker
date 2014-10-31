@@ -7,7 +7,7 @@ If your experience deviates from this document, please document the changes
 to keep it up-to-date.
 
 It is important to note that this document assumes that the git remote in your
-repository that corresponds to "https://github.com/dotcloud/docker" is named
+repository that corresponds to "https://github.com/docker/docker" is named
 "origin".  If yours is not (for example, if you've chosen to name it "upstream"
 or something similar instead), be sure to adjust the listed snippets for your
 local environment accordingly.  If you are not sure what your upstream remote is
@@ -18,7 +18,7 @@ like:
 
 ```bash
 export GITHUBUSER="YOUR_GITHUB_USER"
-git remote add origin https://github.com/dotcloud/docker.git
+git remote add origin https://github.com/docker/docker.git
 git remote add $GITHUBUSER git@github.com:$GITHUBUSER/docker.git
 ```
 
@@ -32,7 +32,21 @@ git fetch origin
 git branch -D release || true
 git checkout --track origin/release
 git checkout -b bump_$VERSION
+```
+
+If it's a regular release, we usually merge master.
+```bash
 git merge origin/master
+```
+
+Otherwise, if it is a hotfix release, we cherry-pick only the commits we want.
+```bash
+# get the commits ids we want to cherry-pick
+git log
+# cherry-pick the commits starting from the oldest one, without including merge commits
+git cherry-pick <commit-id>
+git cherry-pick <commit-id>
+...
 ```
 
 ### 2. Update CHANGELOG.md
@@ -132,7 +146,7 @@ To make a shared test at http://beta-docs.docker.io:
 (You will need the `awsconfig` file added to the `docs/` dir)
 
 ```bash
-make AWS_S3_BUCKET=beta-docs.docker.io docs-release
+make AWS_S3_BUCKET=beta-docs.docker.io BUILD_ROOT=yes docs-release
 ```
 
 ### 5. Commit and create a pull request to the "release" branch
@@ -141,7 +155,7 @@ make AWS_S3_BUCKET=beta-docs.docker.io docs-release
 git add VERSION CHANGELOG.md
 git commit -m "Bump version to $VERSION"
 git push $GITHUBUSER bump_$VERSION
-echo "https://github.com/$GITHUBUSER/docker/compare/dotcloud:release...$GITHUBUSER:bump_$VERSION?expand=1"
+echo "https://github.com/$GITHUBUSER/docker/compare/docker:release...$GITHUBUSER:bump_$VERSION?expand=1"
 ```
 
 That last command will give you the proper link to visit to ensure that you
@@ -159,7 +173,7 @@ Replace "..." with the respective credentials:
 ```bash
 docker build -t docker .
 docker run \
-       -e AWS_S3_BUCKET=test.docker.io \
+       -e AWS_S3_BUCKET=test.docker.com \
        -e AWS_ACCESS_KEY="..." \
        -e AWS_SECRET_KEY="..." \
        -e GPG_PASSPHRASE="..." \
@@ -169,11 +183,11 @@ docker run \
 ```
 
 It will run the test suite, build the binaries and packages,
-and upload to the specified bucket (you should use test.docker.io for
-general testing, and once everything is fine, switch to get.docker.io as
+and upload to the specified bucket (you should use test.docker.com for
+general testing, and once everything is fine, switch to get.docker.com as
 noted below).
 
-After the binaries and packages are uploaded to test.docker.io, make sure
+After the binaries and packages are uploaded to test.docker.com, make sure
 they get tested in both Ubuntu and Debian for any obvious installation
 issues or runtime issues.
 
@@ -181,19 +195,19 @@ Announcing on IRC in both `#docker` and `#docker-dev` is a great way to get
 help testing!  An easy way to get some useful links for sharing:
 
 ```bash
-echo "Ubuntu/Debian install script: curl -sLS https://test.docker.io/ | sh"
-echo "Linux 64bit binary: https://test.docker.io/builds/Linux/x86_64/docker-${VERSION#v}"
-echo "Darwin/OSX 64bit client binary: https://test.docker.io/builds/Darwin/x86_64/docker-${VERSION#v}"
-echo "Darwin/OSX 32bit client binary: https://test.docker.io/builds/Darwin/i386/docker-${VERSION#v}"
-echo "Linux 64bit tgz: https://test.docker.io/builds/Linux/x86_64/docker-${VERSION#v}.tgz"
+echo "Ubuntu/Debian: https://test.docker.com/ubuntu or curl -sSL https://test.docker.com/ | sh"
+echo "Linux 64bit binary: https://test.docker.com/builds/Linux/x86_64/docker-${VERSION#v}"
+echo "Darwin/OSX 64bit client binary: https://test.docker.com/builds/Darwin/x86_64/docker-${VERSION#v}"
+echo "Darwin/OSX 32bit client binary: https://test.docker.com/builds/Darwin/i386/docker-${VERSION#v}"
+echo "Linux 64bit tgz: https://test.docker.com/builds/Linux/x86_64/docker-${VERSION#v}.tgz"
 ```
 
 Once they're tested and reasonably believed to be working, run against
-get.docker.io:
+get.docker.com:
 
 ```bash
 docker run \
-       -e AWS_S3_BUCKET=get.docker.io \
+       -e AWS_S3_BUCKET=get.docker.com \
        -e AWS_ACCESS_KEY="..." \
        -e AWS_SECRET_KEY="..." \
        -e GPG_PASSPHRASE="..." \
@@ -221,7 +235,7 @@ documented and give appropriate warnings.
 ### 9. Apply tag
 
 It's very important that we don't make the tag until after the official
-release is uploaded to get.docker.io!
+release is uploaded to get.docker.com!
 
 ```bash
 git tag -a $VERSION -m $VERSION bump_$VERSION
@@ -235,6 +249,16 @@ branch afterwards!
 
 ### 11. Update the docs branch
 
+If this is a MAJOR.MINOR.0 release, you need to make an branch for the previous release's
+documentation:
+
+```bash
+git checkout -b docs-$PREVIOUS_MAJOR_MINOR docs
+git fetch
+git reset --hard origin/docs
+git push -f origin docs-$PREVIOUS_MAJOR_MINOR
+```
+
 You will need the `awsconfig` file added to the `docs/` directory to contain the
 s3 credentials for the bucket you are deploying to.
 
@@ -243,12 +267,14 @@ git checkout -b docs release || git checkout docs
 git fetch
 git reset --hard origin/release
 git push -f origin docs
-make AWS_S3_BUCKET=docs.docker.io docs-release
+make AWS_S3_BUCKET=docs.docker.com BUILD_ROOT=yes docs-release
 ```
 
-The docs will appear on http://docs.docker.io/ (though there may be cached
-versions, so its worth checking http://docs.docker.io.s3-website-us-west-2.amazonaws.com/).
+The docs will appear on http://docs.docker.com/ (though there may be cached
+versions, so its worth checking http://docs.docker.com.s3-website-us-east-1.amazonaws.com/).
 For more information about documentation releases, see `docs/README.md`.
+
+Ask Sven, or JohnC to invalidate the cloudfront cache using the CND Planet chrome applet.
 
 ### 12. Create a new pull request to merge release back into master
 
@@ -262,7 +288,7 @@ echo ${VERSION#v}-dev > VERSION
 git add VERSION
 git commit -m "Change version to $(cat VERSION)"
 git push $GITHUBUSER merge_release_$VERSION
-echo "https://github.com/$GITHUBUSER/docker/compare/dotcloud:master...$GITHUBUSER:merge_release_$VERSION?expand=1"
+echo "https://github.com/$GITHUBUSER/docker/compare/docker:master...$GITHUBUSER:merge_release_$VERSION?expand=1"
 ```
 
 Again, get two maintainers to validate, then merge, then push that pretty

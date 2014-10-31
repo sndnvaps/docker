@@ -1,8 +1,11 @@
+// +build linux,cgo
+
 package native
 
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -11,47 +14,22 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/docker/docker/daemon/execdriver"
+	"github.com/docker/docker/pkg/term"
 	"github.com/docker/libcontainer"
 	"github.com/docker/libcontainer/apparmor"
 	"github.com/docker/libcontainer/cgroups/fs"
 	"github.com/docker/libcontainer/cgroups/systemd"
+	consolepkg "github.com/docker/libcontainer/console"
 	"github.com/docker/libcontainer/namespaces"
-	"github.com/dotcloud/docker/daemon/execdriver"
-	"github.com/dotcloud/docker/pkg/system"
+	_ "github.com/docker/libcontainer/namespaces/nsenter"
+	"github.com/docker/libcontainer/system"
 )
 
 const (
 	DriverName = "native"
 	Version    = "0.2"
 )
-
-func init() {
-	execdriver.RegisterInitFunc(DriverName, func(args *execdriver.InitArgs) error {
-		var container *libcontainer.Config
-		f, err := os.Open(filepath.Join(args.Root, "container.json"))
-		if err != nil {
-			return err
-		}
-		if err := json.NewDecoder(f).Decode(&container); err != nil {
-			f.Close()
-			return err
-		}
-		f.Close()
-
-		rootfs, err := os.Getwd()
-		if err != nil {
-			return err
-		}
-		syncPipe, err := namespaces.NewSyncPipeFromFd(0, uintptr(args.Pipe))
-		if err != nil {
-			return err
-		}
-		if err := namespaces.Init(container, rootfs, args.Console, syncPipe, args.Args); err != nil {
-			return err
-		}
-		return nil
-	})
-}
 
 type activeContainer struct {
 	container *libcontainer.Config
@@ -88,36 +66,44 @@ func (d *driver) Run(c *execdriver.Command, pipes *execdriver.Pipes, startCallba
 	if err != nil {
 		return -1, err
 	}
+
+	var term execdriver.Terminal
+
+	if c.ProcessConfig.Tty {
+		term, err = NewTtyConsole(&c.ProcessConfig, pipes)
+	} else {
+		term, err = execdriver.NewStdConsole(&c.ProcessConfig, pipes)
+	}
+	if err != nil {
+		return -1, err
+	}
+	c.ProcessConfig.Terminal = term
+
 	d.Lock()
 	d.activeContainers[c.ID] = &activeContainer{
 		container: container,
-		cmd:       &c.Cmd,
+		cmd:       &c.ProcessConfig.Cmd,
 	}
 	d.Unlock()
 
 	var (
 		dataPath = filepath.Join(d.root, c.ID)
-		args     = append([]string{c.Entrypoint}, c.Arguments...)
+		args     = append([]string{c.ProcessConfig.Entrypoint}, c.ProcessConfig.Arguments...)
 	)
+
 	if err := d.createContainerRoot(c.ID); err != nil {
 		return -1, err
 	}
-	defer d.removeContainerRoot(c.ID)
+	defer d.cleanContainer(c.ID)
 
 	if err := d.writeContainerFile(container, c.ID); err != nil {
 		return -1, err
 	}
 
-	term := getTerminal(c, pipes)
-
-	return namespaces.Exec(container, term, c.Rootfs, dataPath, args, func(container *libcontainer.Config, console, rootfs, dataPath, init string, child *os.File, args []string) *exec.Cmd {
-		// we need to join the rootfs because namespaces will setup the rootfs and chroot
-		initPath := filepath.Join(c.Rootfs, c.InitPath)
-
-		c.Path = d.initPath
-		c.Args = append([]string{
-			initPath,
-			"-driver", DriverName,
+	return namespaces.Exec(container, c.ProcessConfig.Stdin, c.ProcessConfig.Stdout, c.ProcessConfig.Stderr, c.ProcessConfig.Console, dataPath, args, func(container *libcontainer.Config, console, dataPath, init string, child *os.File, args []string) *exec.Cmd {
+		c.ProcessConfig.Path = d.initPath
+		c.ProcessConfig.Args = append([]string{
+			DriverName,
 			"-console", console,
 			"-pipe", "3",
 			"-root", filepath.Join(d.root, c.ID),
@@ -125,24 +111,25 @@ func (d *driver) Run(c *execdriver.Command, pipes *execdriver.Pipes, startCallba
 		}, args...)
 
 		// set this to nil so that when we set the clone flags anything else is reset
-		c.SysProcAttr = nil
-		system.SetCloneFlags(&c.Cmd, uintptr(namespaces.GetNamespaceFlags(container.Namespaces)))
-		c.ExtraFiles = []*os.File{child}
+		c.ProcessConfig.SysProcAttr = &syscall.SysProcAttr{
+			Cloneflags: uintptr(namespaces.GetNamespaceFlags(container.Namespaces)),
+		}
+		c.ProcessConfig.ExtraFiles = []*os.File{child}
 
-		c.Env = container.Env
-		c.Dir = c.Rootfs
+		c.ProcessConfig.Env = container.Env
+		c.ProcessConfig.Dir = container.RootFs
 
-		return &c.Cmd
+		return &c.ProcessConfig.Cmd
 	}, func() {
 		if startCallback != nil {
-			c.ContainerPid = c.Process.Pid
-			startCallback(c)
+			c.ContainerPid = c.ProcessConfig.Process.Pid
+			startCallback(&c.ProcessConfig, c.ContainerPid)
 		}
 	})
 }
 
 func (d *driver) Kill(p *execdriver.Command, sig int) error {
-	return syscall.Kill(p.Process.Pid, syscall.Signal(sig))
+	return syscall.Kill(p.ProcessConfig.Process.Pid, syscall.Signal(sig))
 }
 
 func (d *driver) Pause(c *execdriver.Command) error {
@@ -190,15 +177,17 @@ func (d *driver) Terminate(p *execdriver.Command) error {
 		state = &libcontainer.State{InitStartTime: string(data)}
 	}
 
-	currentStartTime, err := system.GetProcessStartTime(p.Process.Pid)
+	currentStartTime, err := system.GetProcessStartTime(p.ProcessConfig.Process.Pid)
 	if err != nil {
 		return err
 	}
+
 	if state.InitStartTime == currentStartTime {
-		err = syscall.Kill(p.Process.Pid, 9)
-		syscall.Wait4(p.Process.Pid, nil, 0, nil)
+		err = syscall.Kill(p.ProcessConfig.Process.Pid, 9)
+		syscall.Wait4(p.ProcessConfig.Process.Pid, nil, 0, nil)
 	}
-	d.removeContainerRoot(p.ID)
+	d.cleanContainer(p.ID)
+
 	return err
 
 }
@@ -238,15 +227,18 @@ func (d *driver) writeContainerFile(container *libcontainer.Config, id string) e
 	return ioutil.WriteFile(filepath.Join(d.root, id, "container.json"), data, 0655)
 }
 
+func (d *driver) cleanContainer(id string) error {
+	d.Lock()
+	delete(d.activeContainers, id)
+	d.Unlock()
+	return os.RemoveAll(filepath.Join(d.root, id, "container.json"))
+}
+
 func (d *driver) createContainerRoot(id string) error {
 	return os.MkdirAll(filepath.Join(d.root, id), 0655)
 }
 
-func (d *driver) removeContainerRoot(id string) error {
-	d.Lock()
-	delete(d.activeContainers, id)
-	d.Unlock()
-
+func (d *driver) Clean(id string) error {
 	return os.RemoveAll(filepath.Join(d.root, id))
 }
 
@@ -260,17 +252,60 @@ func getEnv(key string, env []string) string {
 	return ""
 }
 
-func getTerminal(c *execdriver.Command, pipes *execdriver.Pipes) namespaces.Terminal {
-	var term namespaces.Terminal
-	if c.Tty {
-		term = &dockerTtyTerm{
-			pipes: pipes,
-		}
-	} else {
-		term = &dockerStdTerm{
-			pipes: pipes,
-		}
+type TtyConsole struct {
+	MasterPty *os.File
+}
+
+func NewTtyConsole(processConfig *execdriver.ProcessConfig, pipes *execdriver.Pipes) (*TtyConsole, error) {
+	ptyMaster, console, err := consolepkg.CreateMasterAndConsole()
+	if err != nil {
+		return nil, err
 	}
-	c.Terminal = term
-	return term
+
+	tty := &TtyConsole{
+		MasterPty: ptyMaster,
+	}
+
+	if err := tty.AttachPipes(&processConfig.Cmd, pipes); err != nil {
+		tty.Close()
+		return nil, err
+	}
+
+	processConfig.Console = console
+
+	return tty, nil
+}
+
+func (t *TtyConsole) Master() *os.File {
+	return t.MasterPty
+}
+
+func (t *TtyConsole) Resize(h, w int) error {
+	return term.SetWinsize(t.MasterPty.Fd(), &term.Winsize{Height: uint16(h), Width: uint16(w)})
+}
+
+func (t *TtyConsole) AttachPipes(command *exec.Cmd, pipes *execdriver.Pipes) error {
+	go func() {
+		if wb, ok := pipes.Stdout.(interface {
+			CloseWriters() error
+		}); ok {
+			defer wb.CloseWriters()
+		}
+
+		io.Copy(pipes.Stdout, t.MasterPty)
+	}()
+
+	if pipes.Stdin != nil {
+		go func() {
+			io.Copy(t.MasterPty, pipes.Stdin)
+
+			pipes.Stdin.Close()
+		}()
+	}
+
+	return nil
+}
+
+func (t *TtyConsole) Close() error {
+	return t.MasterPty.Close()
 }

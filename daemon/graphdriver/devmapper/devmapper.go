@@ -1,4 +1,4 @@
-// +build linux,amd64
+// +build linux
 
 package devmapper
 
@@ -9,7 +9,7 @@ import (
 	"runtime"
 	"syscall"
 
-	"github.com/dotcloud/docker/utils"
+	log "github.com/Sirupsen/logrus"
 )
 
 type DevmapperLogger interface {
@@ -51,6 +51,7 @@ var (
 	ErrTaskSetRo              = errors.New("dm_task_set_ro failed")
 	ErrTaskAddTarget          = errors.New("dm_task_add_target failed")
 	ErrTaskSetSector          = errors.New("dm_task_set_sector failed")
+	ErrTaskGetDeps            = errors.New("dm_task_get_deps failed")
 	ErrTaskGetInfo            = errors.New("dm_task_get_info failed")
 	ErrTaskGetDriverVersion   = errors.New("dm_task_get_driver_version failed")
 	ErrTaskSetCookie          = errors.New("dm_task_set_cookie failed")
@@ -74,6 +75,11 @@ var (
 type (
 	Task struct {
 		unmanaged *CDmTask
+	}
+	Deps struct {
+		Count  uint32
+		Filler uint32
+		Device []uint64
 	}
 	Info struct {
 		Exists        int
@@ -171,6 +177,14 @@ func (t *Task) AddTarget(start, size uint64, ttype, params string) error {
 	return nil
 }
 
+func (t *Task) GetDeps() (*Deps, error) {
+	var deps *Deps
+	if deps = DmTaskGetDeps(t.unmanaged); deps == nil {
+		return nil, ErrTaskGetDeps
+	}
+	return deps, nil
+}
+
 func (t *Task) GetInfo() (*Info, error) {
 	info := &Info{}
 	if res := DmTaskGetInfo(t.unmanaged, info); res != 1 {
@@ -198,7 +212,7 @@ func (t *Task) GetNextTarget(next uintptr) (nextPtr uintptr, start uint64,
 func getLoopbackBackingFile(file *os.File) (uint64, uint64, error) {
 	loopInfo, err := ioctlLoopGetStatus64(file.Fd())
 	if err != nil {
-		utils.Errorf("Error get loopback backing file: %s\n", err)
+		log.Errorf("Error get loopback backing file: %s", err)
 		return 0, 0, ErrGetLoopbackBackingFile
 	}
 	return loopInfo.loDevice, loopInfo.loInode, nil
@@ -206,7 +220,7 @@ func getLoopbackBackingFile(file *os.File) (uint64, uint64, error) {
 
 func LoopbackSetCapacity(file *os.File) error {
 	if err := ioctlLoopSetCapacity(file.Fd(), 0); err != nil {
-		utils.Errorf("Error loopbackSetCapacity: %s", err)
+		log.Errorf("Error loopbackSetCapacity: %s", err)
 		return ErrLoopbackSetCapacity
 	}
 	return nil
@@ -246,7 +260,7 @@ func FindLoopDeviceFor(file *os.File) *os.File {
 
 func UdevWait(cookie uint) error {
 	if res := DmUdevWait(cookie); res != 1 {
-		utils.Debugf("Failed to wait on udev cookie %d", cookie)
+		log.Debugf("Failed to wait on udev cookie %d", cookie)
 		return ErrUdevWait
 	}
 	return nil
@@ -265,7 +279,7 @@ func logInit(logger DevmapperLogger) {
 
 func SetDevDir(dir string) error {
 	if res := DmSetDevDir(dir); res != 1 {
-		utils.Debugf("Error dm_set_dev_dir")
+		log.Debugf("Error dm_set_dev_dir")
 		return ErrSetDevDir
 	}
 	return nil
@@ -286,7 +300,7 @@ func RemoveDevice(name string) error {
 		return ErrCreateRemoveTask
 	}
 	if err := task.SetName(name); err != nil {
-		utils.Debugf("Can't set task name %s", name)
+		log.Debugf("Can't set task name %s", name)
 		return err
 	}
 	if err := task.Run(); err != nil {
@@ -298,7 +312,7 @@ func RemoveDevice(name string) error {
 func GetBlockDeviceSize(file *os.File) (uint64, error) {
 	size, err := ioctlBlkGetSize64(file.Fd())
 	if err != nil {
-		utils.Errorf("Error getblockdevicesize: %s", err)
+		log.Errorf("Error getblockdevicesize: %s", err)
 		return 0, ErrGetBlockSize
 	}
 	return uint64(size), nil
@@ -392,6 +406,17 @@ func createTask(t TaskType, name string) (*Task, error) {
 	return task, nil
 }
 
+func getDeps(name string) (*Deps, error) {
+	task, err := createTask(DeviceDeps, name)
+	if task == nil {
+		return nil, err
+	}
+	if err := task.Run(); err != nil {
+		return nil, err
+	}
+	return task.GetDeps()
+}
+
 func getInfo(name string) (*Info, error) {
 	task, err := createTask(DeviceInfo, name)
 	if task == nil {
@@ -417,21 +442,21 @@ func getDriverVersion() (string, error) {
 func getStatus(name string) (uint64, uint64, string, string, error) {
 	task, err := createTask(DeviceStatus, name)
 	if task == nil {
-		utils.Debugf("getStatus: Error createTask: %s", err)
+		log.Debugf("getStatus: Error createTask: %s", err)
 		return 0, 0, "", "", err
 	}
 	if err := task.Run(); err != nil {
-		utils.Debugf("getStatus: Error Run: %s", err)
+		log.Debugf("getStatus: Error Run: %s", err)
 		return 0, 0, "", "", err
 	}
 
 	devinfo, err := task.GetInfo()
 	if err != nil {
-		utils.Debugf("getStatus: Error GetInfo: %s", err)
+		log.Debugf("getStatus: Error GetInfo: %s", err)
 		return 0, 0, "", "", err
 	}
 	if devinfo.Exists == 0 {
-		utils.Debugf("getStatus: Non existing device %s", name)
+		log.Debugf("getStatus: Non existing device %s", name)
 		return 0, 0, "", "", fmt.Errorf("Non existing device %s", name)
 	}
 
@@ -491,7 +516,7 @@ func resumeDevice(name string) error {
 }
 
 func createDevice(poolName string, deviceId *int) error {
-	utils.Debugf("[devmapper] createDevice(poolName=%v, deviceId=%v)", poolName, *deviceId)
+	log.Debugf("[devmapper] createDevice(poolName=%v, deviceId=%v)", poolName, *deviceId)
 
 	for {
 		task, err := createTask(DeviceTargetMsg, poolName)
@@ -542,8 +567,8 @@ func deleteDevice(poolName string, deviceId int) error {
 }
 
 func removeDevice(name string) error {
-	utils.Debugf("[devmapper] removeDevice START")
-	defer utils.Debugf("[devmapper] removeDevice END")
+	log.Debugf("[devmapper] removeDevice START")
+	defer log.Debugf("[devmapper] removeDevice END")
 	task, err := createTask(DeviceRemove, name)
 	if task == nil {
 		return err

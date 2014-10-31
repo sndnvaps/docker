@@ -5,11 +5,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dotcloud/docker/nat"
+	"github.com/docker/docker/nat"
 )
 
 func parse(t *testing.T, args string) (*Config, *HostConfig, error) {
-	config, hostConfig, _, err := Parse(strings.Split(args+" ubuntu bash", " "), nil)
+	config, hostConfig, _, err := parseRun(strings.Split(args+" ubuntu bash", " "), nil)
 	return config, hostConfig, err
 }
 

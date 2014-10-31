@@ -11,9 +11,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dotcloud/docker/api"
-	"github.com/dotcloud/docker/engine"
-	"github.com/dotcloud/docker/pkg/version"
+	"github.com/docker/docker/api"
+	"github.com/docker/docker/engine"
+	"github.com/docker/docker/pkg/version"
 )
 
 func TestGetBoolParam(t *testing.T) {
@@ -448,6 +448,29 @@ func TestGetImagesByName(t *testing.T) {
 	}
 	if stdoutJson.(map[string]interface{})["dirty"].(float64) != 1 {
 		t.Fatalf("%#v", stdoutJson)
+	}
+}
+
+func TestDeleteContainers(t *testing.T) {
+	eng := engine.New()
+	name := "foo"
+	var called bool
+	eng.Register("rm", func(job *engine.Job) engine.Status {
+		called = true
+		if len(job.Args) == 0 {
+			t.Fatalf("Job arguments is empty")
+		}
+		if job.Args[0] != name {
+			t.Fatalf("name != '%s': %#v", name, job.Args[0])
+		}
+		return engine.StatusOK
+	})
+	r := serveRequest("DELETE", "/containers/"+name, nil, eng, t)
+	if !called {
+		t.Fatalf("handler was not called")
+	}
+	if r.Code != http.StatusNoContent {
+		t.Fatalf("Got status %d, expected %d", r.Code, http.StatusNoContent)
 	}
 }
 
