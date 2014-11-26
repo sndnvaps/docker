@@ -49,10 +49,12 @@ You can still call an old version of the API using
 `GET /info`
 
 **New!**
-`info` now returns the number of CPUs available on the machine (`NCPU`) and
-total memory available (`MemTotal`).
+`info` now returns the number of CPUs available on the machine (`NCPU`),
+total memory available (`MemTotal`), a user-friendly name describing the running Docker daemon (`Name`), a unique ID identifying the daemon (`ID`), and
+a list of daemon labels (`Labels`).
 
 `POST /containers/create`
+
 **New!**
 You can set the new container's MAC address explicitly.
 
@@ -61,6 +63,11 @@ You can set the new container's MAC address explicitly.
 **New!**
 Passing the container's `HostConfig` on start is now deprecated.  You should
 set this when creating the container.
+
+`POST /containers/(id)/copy`
+
+**New!**
+You can now copy data which is contained in a volume.
 
 ## v1.15
 

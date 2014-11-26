@@ -36,10 +36,22 @@ type (
 		NoLchown    bool
 		Name        string
 	}
+
+	// Archiver allows the reuse of most utility functions of this package
+	// with a pluggable Untar function.
+	Archiver struct {
+		Untar func(io.Reader, string, *TarOptions) error
+	}
+
+	// breakoutError is used to differentiate errors related to breaking out
+	// When testing archive breakout in the unit tests, this error is expected
+	// in order for the test to pass.
+	breakoutError error
 )
 
 var (
 	ErrNotImplemented = errors.New("Function not implemented")
+	defaultArchiver   = &Archiver{Untar}
 )
 
 const (
@@ -185,20 +197,11 @@ func (ta *tarAppender) addTarFile(path, name string) error {
 
 	hdr.Name = name
 
-	var (
-		nlink uint32
-		inode uint64
-	)
-	if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
-		nlink = uint32(stat.Nlink)
-		inode = uint64(stat.Ino)
-		// Currently go does not fill in the major/minors
-		if stat.Mode&syscall.S_IFBLK == syscall.S_IFBLK ||
-			stat.Mode&syscall.S_IFCHR == syscall.S_IFCHR {
-			hdr.Devmajor = int64(major(uint64(stat.Rdev)))
-			hdr.Devminor = int64(minor(uint64(stat.Rdev)))
-		}
+	nlink, inode, err := setHeaderForSpecialDevice(hdr, ta, name, fi.Sys())
+	if err != nil {
+		return err
 	}
+
 	// if it's a regular file and has more than 1 link,
 	// it's hardlinked, so set the type flag accordingly
 	if fi.Mode().IsRegular() && nlink > 1 {
@@ -284,16 +287,30 @@ func createTarFile(path, extractDir string, hdr *tar.Header, reader io.Reader, L
 			mode |= syscall.S_IFIFO
 		}
 
-		if err := syscall.Mknod(path, mode, int(mkdev(hdr.Devmajor, hdr.Devminor))); err != nil {
+		if err := system.Mknod(path, mode, int(system.Mkdev(hdr.Devmajor, hdr.Devminor))); err != nil {
 			return err
 		}
 
 	case tar.TypeLink:
-		if err := os.Link(filepath.Join(extractDir, hdr.Linkname), path); err != nil {
+		targetPath := filepath.Join(extractDir, hdr.Linkname)
+		// check for hardlink breakout
+		if !strings.HasPrefix(targetPath, extractDir) {
+			return breakoutError(fmt.Errorf("invalid hardlink %q -> %q", targetPath, hdr.Linkname))
+		}
+		if err := os.Link(targetPath, path); err != nil {
 			return err
 		}
 
 	case tar.TypeSymlink:
+		// 	path 				-> hdr.Linkname = targetPath
+		// e.g. /extractDir/path/to/symlink 	-> ../2/file	= /extractDir/path/2/file
+		targetPath := filepath.Join(filepath.Dir(path), hdr.Linkname)
+
+		// the reason we don't need to check symlinks in the path (with FollowSymlinkInScope) is because
+		// that symlink would first have to be created, which would be caught earlier, at this very check:
+		if !strings.HasPrefix(targetPath, extractDir) {
+			return breakoutError(fmt.Errorf("invalid symlink %q -> %q", path, hdr.Linkname))
+		}
 		if err := os.Symlink(hdr.Linkname, path); err != nil {
 			return err
 		}
@@ -448,11 +465,13 @@ func TarWithOptions(srcPath string, options *TarOptions) (io.ReadCloser, error) 
 }
 
 // Untar reads a stream of bytes from `archive`, parses it as a tar archive,
-// and unpacks it into the directory at `path`.
+// and unpacks it into the directory at `dest`.
 // The archive may be compressed with one of the following algorithms:
 //  identity (uncompressed), gzip, bzip2, xz.
 // FIXME: specify behavior when target path exists vs. doesn't exist.
 func Untar(archive io.Reader, dest string, options *TarOptions) error {
+	dest = filepath.Clean(dest)
+
 	if options == nil {
 		options = &TarOptions{}
 	}
@@ -490,6 +509,7 @@ loop:
 		}
 
 		// Normalize name, for safety and for a simple is-root check
+		// This keeps "../" as-is, but normalizes "/../" to "/"
 		hdr.Name = filepath.Clean(hdr.Name)
 
 		for _, exclude := range options.Excludes {
@@ -510,7 +530,11 @@ loop:
 			}
 		}
 
+		// Prevent symlink breakout
 		path := filepath.Join(dest, hdr.Name)
+		if !strings.HasPrefix(path, dest) {
+			return breakoutError(fmt.Errorf("%q is outside of %q", path, dest))
+		}
 
 		// If path exits we almost always just want to remove and replace it
 		// The only exception is when it is a directory *and* the file from
@@ -549,45 +573,47 @@ loop:
 	return nil
 }
 
-// TarUntar is a convenience function which calls Tar and Untar, with
-// the output of one piped into the other. If either Tar or Untar fails,
-// TarUntar aborts and returns the error.
-func TarUntar(src string, dst string) error {
+func (archiver *Archiver) TarUntar(src, dst string) error {
 	log.Debugf("TarUntar(%s %s)", src, dst)
 	archive, err := TarWithOptions(src, &TarOptions{Compression: Uncompressed})
 	if err != nil {
 		return err
 	}
 	defer archive.Close()
-	return Untar(archive, dst, nil)
+	return archiver.Untar(archive, dst, nil)
 }
 
-// UntarPath is a convenience function which looks for an archive
-// at filesystem path `src`, and unpacks it at `dst`.
-func UntarPath(src, dst string) error {
+// TarUntar is a convenience function which calls Tar and Untar, with the output of one piped into the other.
+// If either Tar or Untar fails, TarUntar aborts and returns the error.
+func TarUntar(src, dst string) error {
+	return defaultArchiver.TarUntar(src, dst)
+}
+
+func (archiver *Archiver) UntarPath(src, dst string) error {
 	archive, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer archive.Close()
-	if err := Untar(archive, dst, nil); err != nil {
+	if err := archiver.Untar(archive, dst, nil); err != nil {
 		return err
 	}
 	return nil
 }
 
-// CopyWithTar creates a tar archive of filesystem path `src`, and
-// unpacks it at filesystem path `dst`.
-// The archive is streamed directly with fixed buffering and no
-// intermediary disk IO.
-//
-func CopyWithTar(src, dst string) error {
+// UntarPath is a convenience function which looks for an archive
+// at filesystem path `src`, and unpacks it at `dst`.
+func UntarPath(src, dst string) error {
+	return defaultArchiver.UntarPath(src, dst)
+}
+
+func (archiver *Archiver) CopyWithTar(src, dst string) error {
 	srcSt, err := os.Stat(src)
 	if err != nil {
 		return err
 	}
 	if !srcSt.IsDir() {
-		return CopyFileWithTar(src, dst)
+		return archiver.CopyFileWithTar(src, dst)
 	}
 	// Create dst, copy src's content into it
 	log.Debugf("Creating dest directory: %s", dst)
@@ -595,16 +621,18 @@ func CopyWithTar(src, dst string) error {
 		return err
 	}
 	log.Debugf("Calling TarUntar(%s, %s)", src, dst)
-	return TarUntar(src, dst)
+	return archiver.TarUntar(src, dst)
 }
 
-// CopyFileWithTar emulates the behavior of the 'cp' command-line
-// for a single file. It copies a regular file from path `src` to
-// path `dst`, and preserves all its metadata.
-//
-// If `dst` ends with a trailing slash '/', the final destination path
-// will be `dst/base(src)`.
-func CopyFileWithTar(src, dst string) (err error) {
+// CopyWithTar creates a tar archive of filesystem path `src`, and
+// unpacks it at filesystem path `dst`.
+// The archive is streamed directly with fixed buffering and no
+// intermediary disk IO.
+func CopyWithTar(src, dst string) error {
+	return defaultArchiver.CopyWithTar(src, dst)
+}
+
+func (archiver *Archiver) CopyFileWithTar(src, dst string) (err error) {
 	log.Debugf("CopyFileWithTar(%s, %s)", src, dst)
 	srcSt, err := os.Stat(src)
 	if err != nil {
@@ -652,7 +680,17 @@ func CopyFileWithTar(src, dst string) (err error) {
 			err = er
 		}
 	}()
-	return Untar(r, filepath.Dir(dst), nil)
+	return archiver.Untar(r, filepath.Dir(dst), nil)
+}
+
+// CopyFileWithTar emulates the behavior of the 'cp' command-line
+// for a single file. It copies a regular file from path `src` to
+// path `dst`, and preserves all its metadata.
+//
+// If `dst` ends with a trailing slash '/', the final destination path
+// will be `dst/base(src)`.
+func CopyFileWithTar(src, dst string) (err error) {
+	return defaultArchiver.CopyFileWithTar(src, dst)
 }
 
 // CmdStream executes a command, and returns its stdout as a stream.
@@ -730,17 +768,20 @@ func NewTempArchive(src Archive, dir string) (*TempArchive, error) {
 		return nil, err
 	}
 	size := st.Size()
-	return &TempArchive{f, size}, nil
+	return &TempArchive{f, size, 0}, nil
 }
 
 type TempArchive struct {
 	*os.File
 	Size int64 // Pre-computed from Stat().Size() as a convenience
+	read int64
 }
 
 func (archive *TempArchive) Read(data []byte) (int, error) {
 	n, err := archive.File.Read(data)
-	if err != nil {
+	archive.read += int64(n)
+	if err != nil || archive.read == archive.Size {
+		archive.File.Close()
 		os.Remove(archive.File.Name())
 	}
 	return n, err

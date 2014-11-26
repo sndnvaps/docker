@@ -337,10 +337,35 @@ expose ports to the host, at runtime,
 ## ENV
 
     ENV <key> <value>
+    ENV <key>=<value> ...
 
 The `ENV` instruction sets the environment variable `<key>` to the value
 `<value>`. This value will be passed to all future `RUN` instructions. This is
 functionally equivalent to prefixing the command with `<key>=<value>`
+
+The `ENV` instruction has two forms. The first form, `ENV <key> <value>`,
+will set a single variable to a value. The entire string after the first
+space will be treated as the `<value>` - including characters such as 
+spaces and quotes.
+
+The second form, `ENV <key>=<value> ...`, allows for multiple variables to 
+be set at one time. Notice that the second form uses the equals sign (=) 
+in the syntax, while the first form does not. Like command line parsing, 
+quotes and backslashes can be used to include spaces within values.
+
+For example:
+
+    ENV myName="John Doe" myDog=Rex\ The\ Dog \
+        myCat=fluffy
+
+and
+
+    ENV myName John Doe
+    ENV myDog Rex The Dog
+    ENV myCat fluffy
+
+will yield the same net results in the final container, but the first form 
+does it all in one layer.
 
 The environment variables set using `ENV` will persist when a container is run
 from the resulting image. You can view the values using `docker inspect`, and
@@ -355,9 +380,8 @@ change them using `docker run --env <key>=<value>`.
 
     ADD <src>... <dest>
 
-The `ADD` instruction copies new files,directories or remote file URLs to 
-the filesystem of the container  from `<src>` and add them to the at 
-path `<dest>`.  
+The `ADD` instruction copies new files, directories or remote file URLs from `<src>`
+and adds them to the filesystem of the container at the path `<dest>`.  
 
 Multiple `<src>` resource may be specified but if they are files or 
 directories then they must be relative to the source directory that is 
@@ -376,7 +400,11 @@ destination container.
 All new files and directories are created with a UID and GID of 0.
 
 In the case where `<src>` is a remote file URL, the destination will
-have permissions of 600.
+have permissions of 600. If the remote file being retrieved has an HTTP
+`Last-Modified` header, the timestamp from that header will be used
+to set the `mtime` on the destination file. Then, like any other file
+processed during an `ADD`, `mtime` will be included in the determination
+of whether or not the file has changed and the cache should be updated.
 
 > **Note**:
 > If you build by passing a `Dockerfile` through STDIN (`docker
@@ -417,8 +445,10 @@ The copy obeys the following rules:
   appropriate filename can be discovered in this case (`http://example.com`
   will not work).
 
-- If `<src>` is a directory, the entire directory is copied, including
-  filesystem metadata.
+- If `<src>` is a directory, the entire contents of the directory are copied, 
+  including filesystem metadata. 
+> **Note**:
+> The directory itself is not copied, just its contents.
 
 - If `<src>` is a *local* tar archive in a recognized compression format
   (identity, gzip, bzip2 or xz) then it is unpacked as a directory. Resources
@@ -448,13 +478,11 @@ The copy obeys the following rules:
 
     COPY <src>... <dest>
 
-The `COPY` instruction copies new files,directories or remote file URLs to 
-the filesystem of the container  from `<src>` and add them to the at 
-path `<dest>`. 
+The `COPY` instruction copies new files or directories from `<src>`
+and adds them to the filesystem of the container at the path `<dest>`.
 
-Multiple `<src>` resource may be specified but if they are files or 
-directories then they must be relative to the source directory that is being 
-built (the context of the build).
+Multiple `<src>` resource may be specified but they must be relative
+to the source directory that is being built (the context of the build).
 
 Each `<src>` may contain wildcards and matching will be done using Go's
 [filepath.Match](http://golang.org/pkg/path/filepath#Match) rules.
@@ -479,8 +507,10 @@ The copy obeys the following rules:
   `docker build` is to send the context directory (and subdirectories) to the
   docker daemon.
 
-- If `<src>` is a directory, the entire directory is copied, including
-  filesystem metadata.
+- If `<src>` is a directory, the entire contents of the directory are copied, 
+  including filesystem metadata. 
+> **Note**:
+> The directory itself is not copied, just its contents.
 
 - If `<src>` is any other kind of file, it is copied individually along with
   its metadata. In this case, if `<dest>` ends with a trailing slash `/`, it
@@ -560,6 +590,17 @@ To examine the result further, you can use `docker exec`:
     root         7  0.0  0.1  15572  2164 ?        R+   08:25   0:00 ps aux
 
 And you can gracefully request `top` to shut down using `docker stop test`.
+
+The following `Dockerfile` shows using the `ENTRYPOINT` to run Apache in the
+foreground (i.e., as `PID 1`):
+
+```
+FROM debian:stable
+RUN apt-get update && apt-get install -y --force-yes apache2
+EXPOSE 80 443
+VOLUME ["/var/www", "/var/log/apache2", "/etc/apache2"]
+ENTRYPOINT ["/usr/sbin/apache2ctl", "-D", "FOREGROUND"]
+```
 
 If you need to write a starter script for a single executable, you can ensure that
 the final executable receives the Unix signals by using `exec` and `gosu`
