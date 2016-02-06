@@ -1,13 +1,12 @@
-// Copyright 2014 The Docker & Go Authors. All rights reserved.
+// Copyright 2014-2016 The Docker & Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package mflag_test
+package mflag
 
 import (
 	"bytes"
 	"fmt"
-	. "github.com/docker/docker/pkg/mflag"
 	"os"
 	"sort"
 	"strings"
@@ -149,17 +148,6 @@ func TestGet(t *testing.T) {
 		}
 	}
 	VisitAll(visitor)
-}
-
-func TestUsage(t *testing.T) {
-	called := false
-	ResetForTesting(func() { called = true })
-	if CommandLine.Parse([]string{"-x"}) == nil {
-		t.Error("parse did not fail for unknown flag")
-	}
-	if !called {
-		t.Error("did not call Usage for unknown flag")
-	}
 }
 
 func testParse(f *FlagSet, t *testing.T) {
@@ -524,5 +512,16 @@ func TestSortFlags(t *testing.T) {
 	}
 	if nflag != fs.NFlag() {
 		t.Fatalf("NFlag (%d) != fs.NFlag() (%d) of elements visited", nflag, fs.NFlag())
+	}
+}
+
+func TestMergeFlags(t *testing.T) {
+	base := NewFlagSet("base", ContinueOnError)
+	base.String([]string{"f"}, "", "")
+
+	fs := NewFlagSet("test", ContinueOnError)
+	Merge(fs, base)
+	if len(fs.formal) != 1 {
+		t.Fatalf("FlagCount (%d) != number (1) of elements merged", len(fs.formal))
 	}
 }

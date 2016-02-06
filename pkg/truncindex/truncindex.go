@@ -1,3 +1,6 @@
+// Package truncindex provides a general 'index tree', used by Docker
+// in order to be able to reference containers by only a few unambiguous
+// characters of their id.
 package truncindex
 
 import (
@@ -10,16 +13,19 @@ import (
 )
 
 var (
-	// ErrNoID is thrown when attempting to use empty prefixes
-	ErrNoID        = errors.New("prefix can't be empty")
-	errDuplicateID = errors.New("multiple IDs were found")
-)
+	// ErrEmptyPrefix is an error returned if the prefix was empty.
+	ErrEmptyPrefix = errors.New("Prefix can't be empty")
 
-func init() {
-	// Change patricia max prefix per node length,
-	// because our len(ID) always 64
-	patricia.MaxPrefixPerNode = 64
-}
+	// ErrAmbiguousPrefix is returned if the prefix was ambiguous
+	// (multiple ids for the prefix).
+	ErrAmbiguousPrefix = errors.New("Multiple IDs found with provided prefix")
+
+	// ErrIllegalChar is returned when a space is in the ID
+	ErrIllegalChar = errors.New("illegal character: ' '")
+
+	// ErrNotExist is returned when ID or its prefix not found in index.
+	ErrNotExist = errors.New("ID does not exist")
+)
 
 // TruncIndex allows the retrieval of string identifiers by any of their unique prefixes.
 // This is used to retrieve image and container IDs by more convenient shorthand prefixes.
@@ -29,11 +35,14 @@ type TruncIndex struct {
 	ids  map[string]struct{}
 }
 
-// NewTruncIndex creates a new TruncIndex and initializes with a list of IDs
+// NewTruncIndex creates a new TruncIndex and initializes with a list of IDs.
 func NewTruncIndex(ids []string) (idx *TruncIndex) {
 	idx = &TruncIndex{
-		ids:  make(map[string]struct{}),
-		trie: patricia.NewTrie(),
+		ids: make(map[string]struct{}),
+
+		// Change patricia max prefix per node length,
+		// because our len(ID) always 64
+		trie: patricia.NewTrie(patricia.MaxPrefixPerNode(64)),
 	}
 	for _, id := range ids {
 		idx.addID(id)
@@ -43,10 +52,10 @@ func NewTruncIndex(ids []string) (idx *TruncIndex) {
 
 func (idx *TruncIndex) addID(id string) error {
 	if strings.Contains(id, " ") {
-		return fmt.Errorf("illegal character: ' '")
+		return ErrIllegalChar
 	}
 	if id == "" {
-		return ErrNoID
+		return ErrEmptyPrefix
 	}
 	if _, exists := idx.ids[id]; exists {
 		return fmt.Errorf("id already exists: '%s'", id)
@@ -58,7 +67,7 @@ func (idx *TruncIndex) addID(id string) error {
 	return nil
 }
 
-// Add adds a new ID to the TruncIndex
+// Add adds a new ID to the TruncIndex.
 func (idx *TruncIndex) Add(id string) error {
 	idx.Lock()
 	defer idx.Unlock()
@@ -86,29 +95,37 @@ func (idx *TruncIndex) Delete(id string) error {
 // Get retrieves an ID from the TruncIndex. If there are multiple IDs
 // with the given prefix, an error is thrown.
 func (idx *TruncIndex) Get(s string) (string, error) {
-	idx.RLock()
-	defer idx.RUnlock()
+	if s == "" {
+		return "", ErrEmptyPrefix
+	}
 	var (
 		id string
 	)
-	if s == "" {
-		return "", ErrNoID
-	}
 	subTreeVisitFunc := func(prefix patricia.Prefix, item patricia.Item) error {
 		if id != "" {
 			// we haven't found the ID if there are two or more IDs
 			id = ""
-			return errDuplicateID
+			return ErrAmbiguousPrefix
 		}
 		id = string(prefix)
 		return nil
 	}
 
+	idx.RLock()
+	defer idx.RUnlock()
 	if err := idx.trie.VisitSubtree(patricia.Prefix(s), subTreeVisitFunc); err != nil {
-		return "", fmt.Errorf("no such id: %s", s)
+		return "", err
 	}
 	if id != "" {
 		return id, nil
 	}
-	return "", fmt.Errorf("no such id: %s", s)
+	return "", ErrNotExist
+}
+
+// Iterate iterates over all stored IDs, and passes each of them to the given handler.
+func (idx *TruncIndex) Iterate(handler func(id string)) {
+	idx.trie.Visit(func(prefix patricia.Prefix, item patricia.Item) error {
+		handler(string(prefix))
+		return nil
+	})
 }

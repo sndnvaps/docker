@@ -1,46 +1,19 @@
 package chrootarchive
 
-import (
-	"flag"
-	"fmt"
-	"io/ioutil"
-	"os"
-	"runtime"
-	"syscall"
+import "github.com/docker/docker/pkg/archive"
 
-	"github.com/docker/docker/pkg/archive"
-	"github.com/docker/docker/pkg/reexec"
-)
-
-func applyLayer() {
-	runtime.LockOSThread()
-	flag.Parse()
-
-	if err := syscall.Chroot(flag.Arg(0)); err != nil {
-		fatal(err)
-	}
-	if err := syscall.Chdir("/"); err != nil {
-		fatal(err)
-	}
-	tmpDir, err := ioutil.TempDir("/", "temp-docker-extract")
-	if err != nil {
-		fatal(err)
-	}
-	os.Setenv("TMPDIR", tmpDir)
-	if err := archive.ApplyLayer("/", os.Stdin); err != nil {
-		os.RemoveAll(tmpDir)
-		fatal(err)
-	}
-	os.RemoveAll(tmpDir)
-	os.Exit(0)
+// ApplyLayer parses a diff in the standard layer format from `layer`,
+// and applies it to the directory `dest`. The stream `layer` can only be
+// uncompressed.
+// Returns the size in bytes of the contents of the layer.
+func ApplyLayer(dest string, layer archive.Reader) (size int64, err error) {
+	return applyLayerHandler(dest, layer, &archive.TarOptions{}, true)
 }
 
-func ApplyLayer(dest string, layer archive.ArchiveReader) error {
-	cmd := reexec.Command("docker-applyLayer", dest)
-	cmd.Stdin = layer
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("ApplyLayer %s %s", err, out)
-	}
-	return nil
+// ApplyUncompressedLayer parses a diff in the standard layer format from
+// `layer`, and applies it to the directory `dest`. The stream `layer`
+// can only be uncompressed.
+// Returns the size in bytes of the contents of the layer.
+func ApplyUncompressedLayer(dest string, layer archive.Reader, options *archive.TarOptions) (int64, error) {
+	return applyLayerHandler(dest, layer, options, false)
 }

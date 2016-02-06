@@ -4,47 +4,65 @@ package native
 
 import (
 	"fmt"
-	"os"
-	"os/exec"
 	"path/filepath"
+	"strings"
+	"syscall"
 
 	"github.com/docker/docker/daemon/execdriver"
-	"github.com/docker/docker/daemon/execdriver/native/template"
-	"github.com/docker/libcontainer"
-	"github.com/docker/libcontainer/apparmor"
-	"github.com/docker/libcontainer/devices"
-	"github.com/docker/libcontainer/mount"
-	"github.com/docker/libcontainer/security/capabilities"
+	derr "github.com/docker/docker/errors"
+	"github.com/docker/docker/pkg/mount"
+	"github.com/docker/docker/profiles/seccomp"
+
+	"github.com/docker/docker/volume"
+	"github.com/opencontainers/runc/libcontainer/apparmor"
+	"github.com/opencontainers/runc/libcontainer/configs"
+	"github.com/opencontainers/runc/libcontainer/devices"
 )
 
 // createContainer populates and configures the container type with the
 // data provided by the execdriver.Command
-func (d *driver) createContainer(c *execdriver.Command) (*libcontainer.Config, error) {
-	container := template.New()
-
-	container.Hostname = getEnv("HOSTNAME", c.ProcessConfig.Env)
-	container.Tty = c.ProcessConfig.Tty
-	container.User = c.ProcessConfig.User
-	container.WorkingDir = c.WorkingDir
-	container.Env = c.ProcessConfig.Env
-	container.Cgroups.Name = c.ID
-	container.Cgroups.AllowedDevices = c.AllowedDevices
-	container.MountConfig.DeviceNodes = c.AutoCreatedDevices
-	container.RootFs = c.Rootfs
-
-	// check to see if we are running in ramdisk to disable pivot root
-	container.MountConfig.NoPivotRoot = os.Getenv("DOCKER_RAMDISK") != ""
-	container.RestrictSys = true
+func (d *Driver) createContainer(c *execdriver.Command, hooks execdriver.Hooks) (container *configs.Config, err error) {
+	container = execdriver.InitContainer(c)
 
 	if err := d.createIpc(container, c); err != nil {
 		return nil, err
 	}
 
-	if err := d.createNetwork(container, c); err != nil {
+	if err := d.createPid(container, c); err != nil {
+		return nil, err
+	}
+
+	if err := d.createUTS(container, c); err != nil {
+		return nil, err
+	}
+
+	if err := d.setupRemappedRoot(container, c); err != nil {
+		return nil, err
+	}
+
+	if err := d.createNetwork(container, c, hooks); err != nil {
 		return nil, err
 	}
 
 	if c.ProcessConfig.Privileged {
+		if !container.Readonlyfs {
+			// clear readonly for /sys
+			for i := range container.Mounts {
+				if container.Mounts[i].Destination == "/sys" {
+					container.Mounts[i].Flags &= ^syscall.MS_RDONLY
+				}
+			}
+			container.ReadonlyPaths = nil
+		}
+
+		// clear readonly for cgroup
+		for i := range container.Mounts {
+			if container.Mounts[i].Device == "cgroup" {
+				container.Mounts[i].Flags &= ^syscall.MS_RDONLY
+			}
+		}
+
+		container.MaskPaths = nil
 		if err := d.setPrivileged(container); err != nil {
 			return nil, err
 		}
@@ -52,85 +70,111 @@ func (d *driver) createContainer(c *execdriver.Command) (*libcontainer.Config, e
 		if err := d.setCapabilities(container, c); err != nil {
 			return nil, err
 		}
+
+		if c.SeccompProfile == "" {
+			container.Seccomp = seccomp.GetDefaultProfile()
+		}
 	}
+	// add CAP_ prefix to all caps for new libcontainer update to match
+	// the spec format.
+	for i, s := range container.Capabilities {
+		if !strings.HasPrefix(s, "CAP_") {
+			container.Capabilities[i] = fmt.Sprintf("CAP_%s", s)
+		}
+	}
+	container.AdditionalGroups = c.GroupAdd
 
 	if c.AppArmorProfile != "" {
 		container.AppArmorProfile = c.AppArmorProfile
 	}
 
-	if err := d.setupCgroups(container, c); err != nil {
+	if c.SeccompProfile != "" && c.SeccompProfile != "unconfined" {
+		container.Seccomp, err = seccomp.LoadProfile(c.SeccompProfile)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if err := execdriver.SetupCgroups(container, c); err != nil {
 		return nil, err
+	}
+
+	container.OomScoreAdj = c.OomScoreAdj
+
+	if container.Readonlyfs {
+		for i := range container.Mounts {
+			switch container.Mounts[i].Destination {
+			case "/proc", "/dev", "/dev/pts":
+				continue
+			}
+			container.Mounts[i].Flags |= syscall.MS_RDONLY
+		}
+
+		/* These paths must be remounted as r/o */
+		container.ReadonlyPaths = append(container.ReadonlyPaths, "/dev")
 	}
 
 	if err := d.setupMounts(container, c); err != nil {
 		return nil, err
 	}
 
-	if err := d.setupLabels(container, c); err != nil {
-		return nil, err
-	}
-
-	cmds := make(map[string]*exec.Cmd)
-	d.Lock()
-	for k, v := range d.activeContainers {
-		cmds[k] = v.cmd
-	}
-	d.Unlock()
-
+	d.setupLabels(container, c)
+	d.setupRlimits(container, c)
 	return container, nil
 }
 
-func (d *driver) createNetwork(container *libcontainer.Config, c *execdriver.Command) error {
-	if c.Network.HostNetworking {
-		container.Namespaces["NEWNET"] = false
+func (d *Driver) createNetwork(container *configs.Config, c *execdriver.Command, hooks execdriver.Hooks) error {
+	if c.Network == nil {
 		return nil
 	}
-
-	container.Networks = []*libcontainer.Network{
-		{
-			Mtu:     c.Network.Mtu,
-			Address: fmt.Sprintf("%s/%d", "127.0.0.1", 0),
-			Gateway: "localhost",
-			Type:    "loopback",
-		},
-	}
-
-	if c.Network.Interface != nil {
-		vethNetwork := libcontainer.Network{
-			Mtu:        c.Network.Mtu,
-			Address:    fmt.Sprintf("%s/%d", c.Network.Interface.IPAddress, c.Network.Interface.IPPrefixLen),
-			MacAddress: c.Network.Interface.MacAddress,
-			Gateway:    c.Network.Interface.Gateway,
-			Type:       "veth",
-			Bridge:     c.Network.Interface.Bridge,
-			VethPrefix: "veth",
-		}
-		container.Networks = append(container.Networks, &vethNetwork)
-	}
-
 	if c.Network.ContainerID != "" {
 		d.Lock()
 		active := d.activeContainers[c.Network.ContainerID]
 		d.Unlock()
 
-		if active == nil || active.cmd.Process == nil {
+		if active == nil {
 			return fmt.Errorf("%s is not a valid running container to join", c.Network.ContainerID)
 		}
-		cmd := active.cmd
 
-		nspath := filepath.Join("/proc", fmt.Sprint(cmd.Process.Pid), "ns", "net")
-		container.Networks = append(container.Networks, &libcontainer.Network{
-			Type:   "netns",
-			NsPath: nspath,
-		})
+		state, err := active.State()
+		if err != nil {
+			return err
+		}
+
+		container.Namespaces.Add(configs.NEWNET, state.NamespacePaths[configs.NEWNET])
+		return nil
 	}
 
+	if c.Network.NamespacePath != "" {
+		container.Namespaces.Add(configs.NEWNET, c.Network.NamespacePath)
+		return nil
+	}
+	// only set up prestart hook if the namespace path is not set (this should be
+	// all cases *except* for --net=host shared networking)
+	container.Hooks = &configs.Hooks{
+		Prestart: []configs.Hook{
+			configs.NewFunctionHook(func(s configs.HookState) error {
+				if len(hooks.PreStart) > 0 {
+					for _, fnHook := range hooks.PreStart {
+						// A closed channel for OOM is returned here as it will be
+						// non-blocking and return the correct result when read.
+						chOOM := make(chan struct{})
+						close(chOOM)
+						if err := fnHook(&c.ProcessConfig, s.Pid, chOOM); err != nil {
+							return err
+						}
+					}
+				}
+				return nil
+			}),
+		},
+	}
 	return nil
 }
 
-func (d *driver) createIpc(container *libcontainer.Config, c *execdriver.Command) error {
+func (d *Driver) createIpc(container *configs.Config, c *execdriver.Command) error {
 	if c.Ipc.HostIpc {
-		container.Namespaces["NEWIPC"] = false
+		container.Namespaces.Remove(configs.NEWIPC)
 		return nil
 	}
 
@@ -139,71 +183,328 @@ func (d *driver) createIpc(container *libcontainer.Config, c *execdriver.Command
 		active := d.activeContainers[c.Ipc.ContainerID]
 		d.Unlock()
 
-		if active == nil || active.cmd.Process == nil {
+		if active == nil {
 			return fmt.Errorf("%s is not a valid running container to join", c.Ipc.ContainerID)
 		}
-		cmd := active.cmd
 
-		container.IpcNsPath = filepath.Join("/proc", fmt.Sprint(cmd.Process.Pid), "ns", "ipc")
+		state, err := active.State()
+		if err != nil {
+			return err
+		}
+		container.Namespaces.Add(configs.NEWIPC, state.NamespacePaths[configs.NEWIPC])
 	}
 
 	return nil
 }
 
-func (d *driver) setPrivileged(container *libcontainer.Config) (err error) {
-	container.Capabilities = capabilities.GetAllCapabilities()
-	container.Cgroups.AllowAllDevices = true
+func (d *Driver) createPid(container *configs.Config, c *execdriver.Command) error {
+	if c.Pid.HostPid {
+		container.Namespaces.Remove(configs.NEWPID)
+		return nil
+	}
 
-	hostDeviceNodes, err := devices.GetHostDeviceNodes()
+	return nil
+}
+
+func (d *Driver) createUTS(container *configs.Config, c *execdriver.Command) error {
+	if c.UTS.HostUTS {
+		container.Namespaces.Remove(configs.NEWUTS)
+		container.Hostname = ""
+		return nil
+	}
+
+	return nil
+}
+
+func (d *Driver) setupRemappedRoot(container *configs.Config, c *execdriver.Command) error {
+	if c.RemappedRoot.UID == 0 {
+		container.Namespaces.Remove(configs.NEWUSER)
+		return nil
+	}
+
+	// convert the Docker daemon id map to the libcontainer variant of the same struct
+	// this keeps us from having to import libcontainer code across Docker client + daemon packages
+	cuidMaps := []configs.IDMap{}
+	cgidMaps := []configs.IDMap{}
+	for _, idMap := range c.UIDMapping {
+		cuidMaps = append(cuidMaps, configs.IDMap(idMap))
+	}
+	for _, idMap := range c.GIDMapping {
+		cgidMaps = append(cgidMaps, configs.IDMap(idMap))
+	}
+	container.UidMappings = cuidMaps
+	container.GidMappings = cgidMaps
+
+	for _, node := range container.Devices {
+		node.Uid = uint32(c.RemappedRoot.UID)
+		node.Gid = uint32(c.RemappedRoot.GID)
+	}
+	// TODO: until a kernel/mount solution exists for handling remount in a user namespace,
+	// we must clear the readonly flag for the cgroups mount (@mrunalp concurs)
+	for i := range container.Mounts {
+		if container.Mounts[i].Device == "cgroup" {
+			container.Mounts[i].Flags &= ^syscall.MS_RDONLY
+		}
+	}
+
+	return nil
+}
+
+func (d *Driver) setPrivileged(container *configs.Config) (err error) {
+	container.Capabilities = execdriver.GetAllCapabilities()
+	container.Cgroups.Resources.AllowAllDevices = true
+
+	hostDevices, err := devices.HostDevices()
 	if err != nil {
 		return err
 	}
-	container.MountConfig.DeviceNodes = hostDeviceNodes
-
-	container.RestrictSys = false
+	container.Devices = hostDevices
 
 	if apparmor.IsEnabled() {
 		container.AppArmorProfile = "unconfined"
 	}
-
 	return nil
 }
 
-func (d *driver) setCapabilities(container *libcontainer.Config, c *execdriver.Command) (err error) {
+func (d *Driver) setCapabilities(container *configs.Config, c *execdriver.Command) (err error) {
 	container.Capabilities, err = execdriver.TweakCapabilities(container.Capabilities, c.CapAdd, c.CapDrop)
 	return err
 }
 
-func (d *driver) setupCgroups(container *libcontainer.Config, c *execdriver.Command) error {
-	if c.Resources != nil {
-		container.Cgroups.CpuShares = c.Resources.CpuShares
-		container.Cgroups.Memory = c.Resources.Memory
-		container.Cgroups.MemoryReservation = c.Resources.Memory
-		container.Cgroups.MemorySwap = c.Resources.MemorySwap
-		container.Cgroups.CpusetCpus = c.Resources.Cpuset
+func (d *Driver) setupRlimits(container *configs.Config, c *execdriver.Command) {
+	if c.Resources == nil {
+		return
 	}
 
-	return nil
-}
-
-func (d *driver) setupMounts(container *libcontainer.Config, c *execdriver.Command) error {
-	for _, m := range c.Mounts {
-		container.MountConfig.Mounts = append(container.MountConfig.Mounts, &mount.Mount{
-			Type:        "bind",
-			Source:      m.Source,
-			Destination: m.Destination,
-			Writable:    m.Writable,
-			Private:     m.Private,
-			Slave:       m.Slave,
+	for _, rlimit := range c.Resources.Rlimits {
+		container.Rlimits = append(container.Rlimits, configs.Rlimit{
+			Type: rlimit.Type,
+			Hard: rlimit.Hard,
+			Soft: rlimit.Soft,
 		})
 	}
+}
 
+// If rootfs mount propagation is RPRIVATE, that means all the volumes are
+// going to be private anyway. There is no need to apply per volume
+// propagation on top. This is just an optimization so that cost of per volume
+// propagation is paid only if user decides to make some volume non-private
+// which will force rootfs mount propagation to be non RPRIVATE.
+func checkResetVolumePropagation(container *configs.Config) {
+	if container.RootPropagation != mount.RPRIVATE {
+		return
+	}
+	for _, m := range container.Mounts {
+		m.PropagationFlags = nil
+	}
+}
+
+func getMountInfo(mountinfo []*mount.Info, dir string) *mount.Info {
+	for _, m := range mountinfo {
+		if m.Mountpoint == dir {
+			return m
+		}
+	}
 	return nil
 }
 
-func (d *driver) setupLabels(container *libcontainer.Config, c *execdriver.Command) error {
-	container.ProcessLabel = c.ProcessLabel
-	container.MountConfig.MountLabel = c.MountLabel
+// Get the source mount point of directory passed in as argument. Also return
+// optional fields.
+func getSourceMount(source string) (string, string, error) {
+	// Ensure any symlinks are resolved.
+	sourcePath, err := filepath.EvalSymlinks(source)
+	if err != nil {
+		return "", "", err
+	}
 
+	mountinfos, err := mount.GetMounts()
+	if err != nil {
+		return "", "", err
+	}
+
+	mountinfo := getMountInfo(mountinfos, sourcePath)
+	if mountinfo != nil {
+		return sourcePath, mountinfo.Optional, nil
+	}
+
+	path := sourcePath
+	for {
+		path = filepath.Dir(path)
+
+		mountinfo = getMountInfo(mountinfos, path)
+		if mountinfo != nil {
+			return path, mountinfo.Optional, nil
+		}
+
+		if path == "/" {
+			break
+		}
+	}
+
+	// If we are here, we did not find parent mount. Something is wrong.
+	return "", "", fmt.Errorf("Could not find source mount of %s", source)
+}
+
+// Ensure mount point on which path is mounted, is shared.
+func ensureShared(path string) error {
+	sharedMount := false
+
+	sourceMount, optionalOpts, err := getSourceMount(path)
+	if err != nil {
+		return err
+	}
+	// Make sure source mount point is shared.
+	optsSplit := strings.Split(optionalOpts, " ")
+	for _, opt := range optsSplit {
+		if strings.HasPrefix(opt, "shared:") {
+			sharedMount = true
+			break
+		}
+	}
+
+	if !sharedMount {
+		return fmt.Errorf("Path %s is mounted on %s but it is not a shared mount.", path, sourceMount)
+	}
 	return nil
+}
+
+// Ensure mount point on which path is mounted, is either shared or slave.
+func ensureSharedOrSlave(path string) error {
+	sharedMount := false
+	slaveMount := false
+
+	sourceMount, optionalOpts, err := getSourceMount(path)
+	if err != nil {
+		return err
+	}
+	// Make sure source mount point is shared.
+	optsSplit := strings.Split(optionalOpts, " ")
+	for _, opt := range optsSplit {
+		if strings.HasPrefix(opt, "shared:") {
+			sharedMount = true
+			break
+		} else if strings.HasPrefix(opt, "master:") {
+			slaveMount = true
+			break
+		}
+	}
+
+	if !sharedMount && !slaveMount {
+		return fmt.Errorf("Path %s is mounted on %s but it is not a shared or slave mount.", path, sourceMount)
+	}
+	return nil
+}
+
+func (d *Driver) setupMounts(container *configs.Config, c *execdriver.Command) error {
+	userMounts := make(map[string]struct{})
+	for _, m := range c.Mounts {
+		userMounts[m.Destination] = struct{}{}
+	}
+
+	// Filter out mounts that are overridden by user supplied mounts
+	var defaultMounts []*configs.Mount
+	_, mountDev := userMounts["/dev"]
+	for _, m := range container.Mounts {
+		if _, ok := userMounts[m.Destination]; !ok {
+			if mountDev && strings.HasPrefix(m.Destination, "/dev/") {
+				container.Devices = nil
+				continue
+			}
+			defaultMounts = append(defaultMounts, m)
+		}
+	}
+	container.Mounts = defaultMounts
+
+	mountPropagationMap := map[string]int{
+		"private":  mount.PRIVATE,
+		"rprivate": mount.RPRIVATE,
+		"shared":   mount.SHARED,
+		"rshared":  mount.RSHARED,
+		"slave":    mount.SLAVE,
+		"rslave":   mount.RSLAVE,
+	}
+
+	for _, m := range c.Mounts {
+		for _, cm := range container.Mounts {
+			if cm.Destination == m.Destination {
+				return derr.ErrorCodeMountDup.WithArgs(m.Destination)
+			}
+		}
+
+		if m.Source == "tmpfs" {
+			var (
+				data  = "size=65536k"
+				flags = syscall.MS_NOEXEC | syscall.MS_NOSUID | syscall.MS_NODEV
+				err   error
+			)
+			if m.Data != "" {
+				flags, data, err = mount.ParseTmpfsOptions(m.Data)
+				if err != nil {
+					return err
+				}
+			}
+			container.Mounts = append(container.Mounts, &configs.Mount{
+				Source:           m.Source,
+				Destination:      m.Destination,
+				Data:             data,
+				Device:           "tmpfs",
+				Flags:            flags,
+				PropagationFlags: []int{mountPropagationMap[volume.DefaultPropagationMode]},
+			})
+			continue
+		}
+		flags := syscall.MS_BIND | syscall.MS_REC
+		var pFlag int
+		if !m.Writable {
+			flags |= syscall.MS_RDONLY
+		}
+
+		// Determine property of RootPropagation based on volume
+		// properties. If a volume is shared, then keep root propagation
+		// shared. This should work for slave and private volumes too.
+		//
+		// For slave volumes, it can be either [r]shared/[r]slave.
+		//
+		// For private volumes any root propagation value should work.
+
+		pFlag = mountPropagationMap[m.Propagation]
+		if pFlag == mount.SHARED || pFlag == mount.RSHARED {
+			if err := ensureShared(m.Source); err != nil {
+				return err
+			}
+			rootpg := container.RootPropagation
+			if rootpg != mount.SHARED && rootpg != mount.RSHARED {
+				execdriver.SetRootPropagation(container, mount.SHARED)
+			}
+		} else if pFlag == mount.SLAVE || pFlag == mount.RSLAVE {
+			if err := ensureSharedOrSlave(m.Source); err != nil {
+				return err
+			}
+			rootpg := container.RootPropagation
+			if rootpg != mount.SHARED && rootpg != mount.RSHARED && rootpg != mount.SLAVE && rootpg != mount.RSLAVE {
+				execdriver.SetRootPropagation(container, mount.RSLAVE)
+			}
+		}
+
+		mount := &configs.Mount{
+			Source:      m.Source,
+			Destination: m.Destination,
+			Device:      "bind",
+			Flags:       flags,
+		}
+
+		if pFlag != 0 {
+			mount.PropagationFlags = []int{pFlag}
+		}
+
+		container.Mounts = append(container.Mounts, mount)
+	}
+
+	checkResetVolumePropagation(container)
+	return nil
+}
+
+func (d *Driver) setupLabels(container *configs.Config, c *execdriver.Command) {
+	container.ProcessLabel = c.ProcessLabel
+	container.MountLabel = c.MountLabel
 }

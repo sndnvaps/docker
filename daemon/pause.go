@@ -1,37 +1,49 @@
 package daemon
 
 import (
-	"github.com/docker/docker/engine"
+	"github.com/docker/docker/container"
+	derr "github.com/docker/docker/errors"
 )
 
-func (daemon *Daemon) ContainerPause(job *engine.Job) engine.Status {
-	if len(job.Args) != 1 {
-		return job.Errorf("Usage: %s CONTAINER", job.Name)
+// ContainerPause pauses a container
+func (daemon *Daemon) ContainerPause(name string) error {
+	container, err := daemon.GetContainer(name)
+	if err != nil {
+		return err
 	}
-	name := job.Args[0]
-	container := daemon.Get(name)
-	if container == nil {
-		return job.Errorf("No such container: %s", name)
+
+	if err := daemon.containerPause(container); err != nil {
+		return err
 	}
-	if err := container.Pause(); err != nil {
-		return job.Errorf("Cannot pause container %s: %s", name, err)
-	}
-	container.LogEvent("pause")
-	return engine.StatusOK
+
+	return nil
 }
 
-func (daemon *Daemon) ContainerUnpause(job *engine.Job) engine.Status {
-	if n := len(job.Args); n < 1 || n > 2 {
-		return job.Errorf("Usage: %s CONTAINER", job.Name)
+// containerPause pauses the container execution without stopping the process.
+// The execution can be resumed by calling containerUnpause.
+func (daemon *Daemon) containerPause(container *container.Container) error {
+	container.Lock()
+	defer container.Unlock()
+
+	// We cannot Pause the container which is not running
+	if !container.Running {
+		return derr.ErrorCodeNotRunning.WithArgs(container.ID)
 	}
-	name := job.Args[0]
-	container := daemon.Get(name)
-	if container == nil {
-		return job.Errorf("No such container: %s", name)
+
+	// We cannot Pause the container which is already paused
+	if container.Paused {
+		return derr.ErrorCodeAlreadyPaused.WithArgs(container.ID)
 	}
-	if err := container.Unpause(); err != nil {
-		return job.Errorf("Cannot unpause container %s: %s", name, err)
+
+	// We cannot Pause the container which is restarting
+	if container.Restarting {
+		return derr.ErrorCodeContainerRestarting.WithArgs(container.ID)
 	}
-	container.LogEvent("unpause")
-	return engine.StatusOK
+
+	if err := daemon.execDriver.Pause(container.Command); err != nil {
+		return derr.ErrorCodeCantPause.WithArgs(container.ID, err)
+	}
+	container.Paused = true
+	daemon.LogContainerEvent(container, "pause")
+	return nil
 }
