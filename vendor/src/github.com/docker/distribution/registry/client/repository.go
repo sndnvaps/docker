@@ -36,8 +36,21 @@ func checkHTTPRedirect(req *http.Request, via []*http.Request) error {
 
 	if len(via) > 0 {
 		for headerName, headerVals := range via[0].Header {
-			if headerName == "Accept" || headerName == "Range" {
-				for _, val := range headerVals {
+			if headerName != "Accept" && headerName != "Range" {
+				continue
+			}
+			for _, val := range headerVals {
+				// Don't add to redirected request if redirected
+				// request already has a header with the same
+				// name and value.
+				hasValue := false
+				for _, existingVal := range req.Header[headerName] {
+					if existingVal == val {
+						hasValue = true
+						break
+					}
+				}
+				if !hasValue {
 					req.Header.Add(headerName, val)
 				}
 			}
@@ -279,19 +292,38 @@ func (t *tags) Get(ctx context.Context, tag string) (distribution.Descriptor, er
 	if err != nil {
 		return distribution.Descriptor{}, err
 	}
-	var attempts int
-	resp, err := t.client.Head(u)
 
+	req, err := http.NewRequest("HEAD", u, nil)
+	if err != nil {
+		return distribution.Descriptor{}, err
+	}
+
+	for _, t := range distribution.ManifestMediaTypes() {
+		req.Header.Add("Accept", t)
+	}
+
+	var attempts int
+	resp, err := t.client.Do(req)
 check:
 	if err != nil {
 		return distribution.Descriptor{}, err
 	}
+	defer resp.Body.Close()
 
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 400:
 		return descriptorFromResponse(resp)
 	case resp.StatusCode == http.StatusMethodNotAllowed:
-		resp, err = t.client.Get(u)
+		req, err = http.NewRequest("GET", u, nil)
+		if err != nil {
+			return distribution.Descriptor{}, err
+		}
+
+		for _, t := range distribution.ManifestMediaTypes() {
+			req.Header.Add("Accept", t)
+		}
+
+		resp, err = t.client.Do(req)
 		attempts++
 		if attempts > 1 {
 			return distribution.Descriptor{}, err

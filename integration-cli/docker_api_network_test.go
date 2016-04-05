@@ -84,6 +84,8 @@ func (s *DockerSuite) TestApiNetworkInspect(c *check.C) {
 	nr = getNetworkResource(c, nr.ID)
 	c.Assert(nr.Driver, checker.Equals, "bridge")
 	c.Assert(nr.Scope, checker.Equals, "local")
+	c.Assert(nr.Internal, checker.Equals, false)
+	c.Assert(nr.EnableIPv6, checker.Equals, false)
 	c.Assert(nr.IPAM.Driver, checker.Equals, "default")
 	c.Assert(len(nr.Containers), checker.Equals, 1)
 	c.Assert(nr.Containers[containerID], checker.NotNil)
@@ -294,8 +296,8 @@ func createNetwork(c *check.C, config types.NetworkCreate, shouldSucceed bool) s
 		return ""
 	}
 
-	c.Assert(status, checker.Equals, http.StatusCreated)
 	c.Assert(err, checker.IsNil)
+	c.Assert(status, checker.Equals, http.StatusCreated)
 
 	var nr types.NetworkCreateResponse
 	err = json.Unmarshal(resp, &nr)
@@ -330,6 +332,6 @@ func deleteNetwork(c *check.C, id string, shouldSucceed bool) {
 		c.Assert(status, checker.Not(checker.Equals), http.StatusOK)
 		return
 	}
-	c.Assert(status, checker.Equals, http.StatusOK)
+	c.Assert(status, checker.Equals, http.StatusNoContent)
 	c.Assert(err, checker.IsNil)
 }

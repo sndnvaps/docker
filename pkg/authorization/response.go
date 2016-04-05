@@ -7,11 +7,15 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+
+	"github.com/Sirupsen/logrus"
 )
 
 // ResponseModifier allows authorization plugins to read and modify the content of the http.response
 type ResponseModifier interface {
 	http.ResponseWriter
+	http.Flusher
+	http.CloseNotifier
 
 	// RawBody returns the current http content
 	RawBody() []byte
@@ -32,7 +36,10 @@ type ResponseModifier interface {
 	OverrideStatusCode(statusCode int)
 
 	// Flush flushes all data to the HTTP response
-	Flush() error
+	FlushAll() error
+
+	// Hijacked indicates the response has been hijacked by the Docker daemon
+	Hijacked() bool
 }
 
 // NewResponseModifier creates a wrapper to an http.ResponseWriter to allow inspecting and modifying the content
@@ -44,23 +51,41 @@ func NewResponseModifier(rw http.ResponseWriter) ResponseModifier {
 // the http request/response from docker daemon
 type responseModifier struct {
 	// The original response writer
-	rw     http.ResponseWriter
-	status int
+	rw http.ResponseWriter
 	// body holds the response body
 	body []byte
 	// header holds the response header
 	header http.Header
 	// statusCode holds the response status code
 	statusCode int
+	// hijacked indicates the request has been hijacked
+	hijacked bool
+}
+
+func (rm *responseModifier) Hijacked() bool {
+	return rm.hijacked
 }
 
 // WriterHeader stores the http status code
 func (rm *responseModifier) WriteHeader(s int) {
+
+	// Use original request if hijacked
+	if rm.hijacked {
+		rm.rw.WriteHeader(s)
+		return
+	}
+
 	rm.statusCode = s
 }
 
 // Header returns the internal http header
 func (rm *responseModifier) Header() http.Header {
+
+	// Use original header if hijacked
+	if rm.hijacked {
+		return rm.rw.Header()
+	}
+
 	return rm.header
 }
 
@@ -90,6 +115,11 @@ func (rm *responseModifier) OverrideHeader(b []byte) error {
 
 // Write stores the byte array inside content
 func (rm *responseModifier) Write(b []byte) (int, error) {
+
+	if rm.hijacked {
+		return rm.rw.Write(b)
+	}
+
 	rm.body = append(rm.body, b...)
 	return len(b), nil
 }
@@ -109,15 +139,41 @@ func (rm *responseModifier) RawHeaders() ([]byte, error) {
 
 // Hijack returns the internal connection of the wrapped http.ResponseWriter
 func (rm *responseModifier) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+
+	rm.hijacked = true
+	rm.FlushAll()
+
 	hijacker, ok := rm.rw.(http.Hijacker)
 	if !ok {
-		return nil, nil, fmt.Errorf("Internal reponse writer doesn't support the Hijacker interface")
+		return nil, nil, fmt.Errorf("Internal response writer doesn't support the Hijacker interface")
 	}
 	return hijacker.Hijack()
 }
 
-// Flush flushes all data to the HTTP response
-func (rm *responseModifier) Flush() error {
+// CloseNotify uses the internal close notify API of the wrapped http.ResponseWriter
+func (rm *responseModifier) CloseNotify() <-chan bool {
+	closeNotifier, ok := rm.rw.(http.CloseNotifier)
+	if !ok {
+		logrus.Errorf("Internal response writer doesn't support the CloseNotifier interface")
+		return nil
+	}
+	return closeNotifier.CloseNotify()
+}
+
+// Flush uses the internal flush API of the wrapped http.ResponseWriter
+func (rm *responseModifier) Flush() {
+	flusher, ok := rm.rw.(http.Flusher)
+	if !ok {
+		logrus.Errorf("Internal response writer doesn't support the Flusher interface")
+		return
+	}
+
+	rm.FlushAll()
+	flusher.Flush()
+}
+
+// FlushAll flushes all data to the HTTP response
+func (rm *responseModifier) FlushAll() error {
 	// Copy the status code
 	if rm.statusCode > 0 {
 		rm.rw.WriteHeader(rm.statusCode)
@@ -130,7 +186,15 @@ func (rm *responseModifier) Flush() error {
 		}
 	}
 
-	// Write body
-	_, err := rm.rw.Write(rm.body)
+	var err error
+	if len(rm.body) > 0 {
+		// Write body
+		_, err = rm.rw.Write(rm.body)
+	}
+
+	// Clean previous data
+	rm.body = nil
+	rm.statusCode = 0
+	rm.header = http.Header{}
 	return err
 }

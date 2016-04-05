@@ -8,24 +8,35 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/distribution/uuid"
 	apiserver "github.com/docker/docker/api/server"
+	"github.com/docker/docker/api/server/router"
+	"github.com/docker/docker/api/server/router/build"
+	"github.com/docker/docker/api/server/router/container"
+	"github.com/docker/docker/api/server/router/image"
+	"github.com/docker/docker/api/server/router/network"
+	systemrouter "github.com/docker/docker/api/server/router/system"
+	"github.com/docker/docker/api/server/router/volume"
 	"github.com/docker/docker/cli"
 	"github.com/docker/docker/cliconfig"
 	"github.com/docker/docker/daemon"
 	"github.com/docker/docker/daemon/logger"
 	"github.com/docker/docker/dockerversion"
+	"github.com/docker/docker/libcontainerd"
 	"github.com/docker/docker/opts"
 	"github.com/docker/docker/pkg/jsonlog"
+	"github.com/docker/docker/pkg/listeners"
 	flag "github.com/docker/docker/pkg/mflag"
 	"github.com/docker/docker/pkg/pidfile"
 	"github.com/docker/docker/pkg/signal"
 	"github.com/docker/docker/pkg/system"
 	"github.com/docker/docker/registry"
+	"github.com/docker/docker/runconfig"
 	"github.com/docker/docker/utils"
 	"github.com/docker/go-connections/tlsconfig"
 )
@@ -42,8 +53,7 @@ var (
 // DaemonCli represents the daemon CLI.
 type DaemonCli struct {
 	*daemon.Config
-	registryOptions *registry.Options
-	flags           *flag.FlagSet
+	flags *flag.FlagSet
 }
 
 func presentInHelp(usage string) string { return usage }
@@ -58,17 +68,17 @@ func NewDaemonCli() *DaemonCli {
 	daemonConfig.LogConfig.Config = make(map[string]string)
 	daemonConfig.ClusterOpts = make(map[string]string)
 
+	if runtime.GOOS != "linux" {
+		daemonConfig.V2Only = true
+	}
+
 	daemonConfig.InstallFlags(daemonFlags, presentInHelp)
 	daemonConfig.InstallFlags(flag.CommandLine, absentFromHelp)
-	registryOptions := new(registry.Options)
-	registryOptions.InstallFlags(daemonFlags, presentInHelp)
-	registryOptions.InstallFlags(flag.CommandLine, absentFromHelp)
 	daemonFlags.Require(flag.Exact, 0)
 
 	return &DaemonCli{
-		Config:          daemonConfig,
-		registryOptions: registryOptions,
-		flags:           daemonFlags,
+		Config: daemonConfig,
+		flags:  daemonFlags,
 	}
 }
 
@@ -226,6 +236,9 @@ func (cli *DaemonCli) CmdDaemon(args ...string) error {
 	if len(cli.Config.Hosts) == 0 {
 		cli.Config.Hosts = make([]string, 1)
 	}
+
+	api := apiserver.New(serverConfig)
+
 	for i := 0; i < len(cli.Config.Hosts); i++ {
 		var err error
 		if cli.Config.Hosts[i], err = opts.ParseHost(cli.Config.TLS, cli.Config.Hosts[i]); err != nil {
@@ -237,12 +250,13 @@ func (cli *DaemonCli) CmdDaemon(args ...string) error {
 		if len(protoAddrParts) != 2 {
 			logrus.Fatalf("bad format %s, expected PROTO://ADDR", protoAddr)
 		}
-		serverConfig.Addrs = append(serverConfig.Addrs, apiserver.Addr{Proto: protoAddrParts[0], Addr: protoAddrParts[1]})
-	}
+		l, err := listeners.Init(protoAddrParts[0], protoAddrParts[1], serverConfig.SocketGroup, serverConfig.TLSConfig)
+		if err != nil {
+			logrus.Fatal(err)
+		}
 
-	api, err := apiserver.New(serverConfig)
-	if err != nil {
-		logrus.Fatal(err)
+		logrus.Debugf("Listener created for HTTP on %s (%s)", protoAddrParts[0], protoAddrParts[1])
+		api.Accept(protoAddrParts[1], l...)
 	}
 
 	if err := migrateKey(); err != nil {
@@ -250,8 +264,13 @@ func (cli *DaemonCli) CmdDaemon(args ...string) error {
 	}
 	cli.TrustKeyPath = commonFlags.TrustKey
 
-	registryService := registry.NewService(cli.registryOptions)
-	d, err := daemon.NewDaemon(cli.Config, registryService)
+	registryService := registry.NewService(cli.Config.ServiceOptions)
+	containerdRemote, err := libcontainerd.New(cli.getLibcontainerdRoot(), cli.getPlatformRemoteOptions()...)
+	if err != nil {
+		logrus.Fatal(err)
+	}
+
+	d, err := daemon.NewDaemon(cli.Config, registryService, containerdRemote)
 	if err != nil {
 		if pfile != nil {
 			if err := pfile.Remove(); err != nil {
@@ -266,18 +285,28 @@ func (cli *DaemonCli) CmdDaemon(args ...string) error {
 	logrus.WithFields(logrus.Fields{
 		"version":     dockerversion.Version,
 		"commit":      dockerversion.GitCommit,
-		"execdriver":  d.ExecutionDriver().Name(),
 		"graphdriver": d.GraphDriverName(),
 	}).Info("Docker daemon")
 
-	api.InitRouters(d)
+	initRouter(api, d)
 
 	reload := func(config *daemon.Config) {
 		if err := d.Reload(config); err != nil {
 			logrus.Errorf("Error reconfiguring the daemon: %v", err)
 			return
 		}
-		api.Reload(config)
+		if config.IsValueSet("debug") {
+			debugEnabled := utils.IsDebugEnabled()
+			switch {
+			case debugEnabled && !config.Debug: // disable debug
+				utils.DisableDebug()
+				api.DisableProfiler()
+			case config.Debug && !debugEnabled: // enable debug
+				utils.EnableDebug()
+				api.EnableProfiler()
+			}
+
+		}
 	}
 
 	setupConfigReloadTrap(*configFile, cli.flags, reload)
@@ -306,6 +335,7 @@ func (cli *DaemonCli) CmdDaemon(args ...string) error {
 	// Wait for serve API to complete
 	errAPI := <-serveAPIWait
 	shutdownDaemon(d, 15)
+	containerdRemote.Cleanup()
 	if errAPI != nil {
 		if pfile != nil {
 			if err := pfile.Remove(); err != nil {
@@ -372,4 +402,21 @@ func loadDaemonCliConfig(config *daemon.Config, daemonFlags *flag.FlagSet, commo
 	setDaemonLogLevel(config.LogLevel)
 
 	return config, nil
+}
+
+func initRouter(s *apiserver.Server, d *daemon.Daemon) {
+	decoder := runconfig.ContainerDecoder{}
+
+	routers := []router.Router{
+		container.NewRouter(d, decoder),
+		image.NewRouter(d, decoder),
+		systemrouter.NewRouter(d),
+		volume.NewRouter(d),
+		build.NewRouter(d),
+	}
+	if d.NetworkControllerEnabled() {
+		routers = append(routers, network.NewRouter(d))
+	}
+
+	s.InitRouter(utils.IsDebugEnabled(), routers...)
 }

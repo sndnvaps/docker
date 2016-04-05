@@ -53,6 +53,10 @@ The following plugins exist:
   another volume plugin that provides multi-host volumes management for Docker
   using GlusterFS.
 
+* The [Horcrux Volume Plugin](https://github.com/muthu-r/horcrux) allows on-demand,
+  version controlled access to your data. Horcrux is an open-source plugin,
+  written in Go, and supports SCP, [Minio](https://www.minio.io) and Amazon S3.
+
 * The [IPFS Volume Plugin](http://github.com/vdemeester/docker-volume-ipfs)
   is an open source volume plugin that allows using an
   [ipfs](https://ipfs.io/) filesystem as a volume.
@@ -63,6 +67,8 @@ The following plugins exist:
 
 * The [Netshare plugin](https://github.com/gondor/docker-volume-netshare) is a volume plugin
   that provides volume management for NFS 3/4, AWS EFS and CIFS file systems.
+
+* The [gce-docker plugin](https://github.com/mcuadros/gce-docker) is a volume plugin able to attach, format and mount Google Compute [persistent-disks](https://cloud.google.com/compute/docs/disks/persistent-disks).
 
 * The [OpenStorage Plugin](https://github.com/libopenstorage/openstorage) is a cluster aware volume plugin that provides volume management for file and block storage solutions.  It implements a vendor neutral specification for implementing extensions such as CoS, encryption, and snapshots.   It has example drivers based on FUSE, NFS, NBD and EBS to name a few.
 
@@ -94,6 +100,11 @@ The following plugins exist:
   Docker networking (libnetwork) remote driver API by utilizing
   Neutron, the OpenStack networking service. It includes an IPAM
   driver as well.
+
+* The [Local Persist Plugin](https://github.com/CWSpear/local-persist) 
+  extends the default `local` driver's functionality by allowing you specify 
+  a mountpoint anywhere on the host, which enables the files to *always persist*, 
+  even if the volume is removed via `docker volume rm`.
 
 ## Troubleshooting a plugin
 

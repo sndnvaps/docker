@@ -44,7 +44,8 @@ need to package Docker your way, without denaturing it in the process.
 To build Docker, you will need the following:
 
 * A recent version of Git and Mercurial
-* Go version 1.4 or later
+* Go version 1.4 or later (Go version 1.5 or later required for hardware signing
+  support in Docker Content Trust)
 * A clean checkout of the source added to a valid [Go
   workspace](https://golang.org/doc/code.html#Workspaces) under the path
   *src/github.com/docker/docker* (unless you plan to use `AUTO_GOPATH`,
@@ -59,7 +60,6 @@ To build the Docker daemon, you will additionally need:
 * btrfs-progs version 3.16.1 or later (unless using an older version is
   absolutely necessary, in which case 3.8 is the minimum)
 * libseccomp version 2.2.1 or later (for build tag seccomp)
-* yubico-piv-tool version 1.1.0 or later (for experimental)
 
 Be sure to also check out Docker's Dockerfile for the most up-to-date list of
 these build-time dependencies.
@@ -161,6 +161,12 @@ If you're building a binary that may need to be used on platforms that include
 SELinux, you will need to use the `selinux` build tag:
 ```bash
 export DOCKER_BUILDTAGS='selinux'
+```
+
+If you're building a binary that may need to be used on platforms that include
+seccomp, you will need to use the `seccomp` build tag:
+```bash
+export DOCKER_BUILDTAGS='seccomp'
 ```
 
 There are build tags for disabling graphdrivers as well. By default, support

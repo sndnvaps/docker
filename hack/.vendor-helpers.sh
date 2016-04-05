@@ -117,10 +117,19 @@ clean() {
 		# This directory contains only .c and .h files which are necessary
 		-path vendor/src/github.com/mattn/go-sqlite3/code
 	)
+
+	# This package is required to build the Etcd client,
+	# but Etcd hard codes a local Godep full path.
+	# FIXME: fix_rewritten_imports fixes this problem in most platforms
+	# but it fails in very small corner cases where it makes the vendor
+	# script to remove this package.
+	# See: https://github.com/docker/docker/issues/19231
+	findArgs+=( -or -path vendor/src/github.com/ugorji/go/codec )
 	for import in "${imports[@]}"; do
 		[ "${#findArgs[@]}" -eq 0 ] || findArgs+=( -or )
 		findArgs+=( -path "vendor/src/$import" )
 	done
+
 	local IFS=$'\n'
 	local prune=( $($find vendor -depth -type d -not '(' "${findArgs[@]}" ')') )
 	unset IFS
@@ -131,6 +140,11 @@ clean() {
 
 	echo -n 'pruning unused files, '
 	$find vendor -type f -name '*_test.go' -exec rm -v '{}' ';'
+	$find vendor -type f -name 'Vagrantfile' -exec rm -v '{}' ';'
+
+	# These are the files that are left over after fix_rewritten_imports is run.
+	echo -n 'pruning .orig files, '
+	$find vendor -type f -name '*.orig' -exec rm -v '{}' ';'
 
 	echo done
 }
@@ -142,5 +156,5 @@ fix_rewritten_imports () {
        local target="vendor/src/$pkg"
 
        echo "$pkg: fixing rewritten imports"
-       $find "$target" -name \*.go -exec sed -i -e "s|\"${remove}|\"|g" {} \;
+       $find "$target" -name \*.go -exec sed -i'.orig' -e "s|\"${remove}|\"|g" {} \;
 }
